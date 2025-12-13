@@ -7,6 +7,10 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { runAppleScript } from 'run-applescript';
+import { parseEmailOutput, buildFolderRef, buildNestedFolderRef, escapeForAppleScript } from './helpers';
+
+// Re-export helpers for testing
+export { parseEmailOutput, buildFolderRef, buildNestedFolderRef, escapeForAppleScript } from './helpers';
 
 // ====================================================
 // 1. Tool Definitions
@@ -21,8 +25,8 @@ const OUTLOOK_MAIL_TOOL: Tool = {
     properties: {
       operation: {
         type: "string",
-        description: "Operation to perform: 'unread', 'search', 'send', 'folders', or 'read'",
-        enum: ["unread", "search", "send", "folders", "read"]
+        description: "Operation to perform: 'unread', 'search', 'send', 'draft', 'reply', 'forward', 'folders', 'read', 'create_folder', 'move_email', 'rename_folder', 'delete_folder', 'count', or 'save_attachments'",
+        enum: ["unread", "search", "send", "draft", "reply", "forward", "folders", "read", "create_folder", "move_email", "rename_folder", "delete_folder", "count", "save_attachments"]
       },
       folder: {
         type: "string",
@@ -35,6 +39,14 @@ const OUTLOOK_MAIL_TOOL: Tool = {
       searchTerm: {
         type: "string",
         description: "Text to search for in emails (required for search operation)"
+      },
+      startDate: {
+        type: "string",
+        description: "Filter emails sent on or after this date (ISO format, e.g., '2025-12-01')"
+      },
+      endDate: {
+        type: "string",
+        description: "Filter emails sent on or before this date (ISO format, e.g., '2025-12-05')"
       },
       to: {
         type: "string",
@@ -50,7 +62,7 @@ const OUTLOOK_MAIL_TOOL: Tool = {
       },
       isHtml: {
         type: "boolean",
-        description: "Whether the body content is HTML (optional for send operation, default: false)"
+        description: "Whether the body content is HTML. ALWAYS use HTML (true) for email creation - Outlook renders HTML natively but treats markdown as plain text. Default: false"
       },
       cc: {
         type: "string",
@@ -62,10 +74,58 @@ const OUTLOOK_MAIL_TOOL: Tool = {
       },
       attachments: {
         type: "array",
-        description: "File paths to attach to the email (optional for send operation)",
+        description: "File paths to attach to the email (optional for send, reply, and forward operations)",
         items: {
           type: "string"
         }
+      },
+      name: {
+        type: "string",
+        description: "Folder name to create (required for create_folder operation)"
+      },
+      parent: {
+        type: "string",
+        description: "Parent folder path for nesting (optional for create_folder operation)"
+      },
+      messageId: {
+        type: "string",
+        description: "Email message ID (required for move_email, forward, and reply operations)"
+      },
+      forwardTo: {
+        type: "string",
+        description: "Email address to forward to (required for forward operation)"
+      },
+      forwardCc: {
+        type: "string",
+        description: "CC email address for forward (optional for forward operation)"
+      },
+      forwardComment: {
+        type: "string",
+        description: "Comment to add above forwarded message (optional for forward operation)"
+      },
+      includeOriginalAttachments: {
+        type: "boolean",
+        description: "Whether to include original email attachments when forwarding (optional for forward operation, default: true)"
+      },
+      replyBody: {
+        type: "string",
+        description: "Reply message content (required for reply operation)"
+      },
+      replyAll: {
+        type: "boolean",
+        description: "Whether to reply to all recipients (optional for reply operation, default: false)"
+      },
+      targetFolder: {
+        type: "string",
+        description: "Destination folder path (required for move_email operation)"
+      },
+      newName: {
+        type: "string",
+        description: "New folder name (required for rename_folder operation)"
+      },
+      destinationFolder: {
+        type: "string",
+        description: "Destination folder path to save attachments (required for save_attachments operation)"
       }
     },
     required: ["operation"]
@@ -81,8 +141,32 @@ const OUTLOOK_CALENDAR_TOOL: Tool = {
     properties: {
       operation: {
         type: "string",
-        description: "Operation to perform: 'today', 'upcoming', 'search', or 'create'",
-        enum: ["today", "upcoming", "search", "create"]
+        description: "Operation to perform: 'today', 'upcoming', 'search', 'create', 'delete', 'accept', 'decline', 'tentative', or 'propose_new_time'",
+        enum: ["today", "upcoming", "search", "create", "delete", "accept", "decline", "tentative", "propose_new_time"]
+      },
+      deleteSubject: {
+        type: "string",
+        description: "Subject of event to delete (required for delete operation). Must match exactly."
+      },
+      deleteDate: {
+        type: "string",
+        description: "Date of event to delete in YYYY-MM-DD format (required for delete operation)"
+      },
+      responseSubject: {
+        type: "string",
+        description: "Subject of meeting invite to respond to (required for accept/decline/tentative/propose_new_time). Must match exactly."
+      },
+      responseDate: {
+        type: "string",
+        description: "Date of meeting invite in YYYY-MM-DD format (required for accept/decline/tentative/propose_new_time)"
+      },
+      proposedStart: {
+        type: "string",
+        description: "Proposed new start time in ISO format (required for propose_new_time operation)"
+      },
+      proposedEnd: {
+        type: "string",
+        description: "Proposed new end time in ISO format (required for propose_new_time operation)"
       },
       searchTerm: {
         type: "string",
@@ -324,96 +408,131 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
 }
 
 // Function to search emails
-async function searchEmails(searchTerm: string, folder: string = "Inbox", limit: number = 10): Promise<any[]> {
-  console.error(`[searchEmails] Searching for "${searchTerm}" in folder: ${folder}, limit: ${limit}`);
+async function searchEmails(searchTerm: string, folder: string = "Inbox", limit: number = 10, startDate?: string, endDate?: string): Promise<any[]> {
+  console.error(`[searchEmails] Searching for "${searchTerm}" in folder: ${folder}, limit: ${limit}, startDate: ${startDate}, endDate: ${endDate}`);
   await checkOutlookAccess();
-  
-  const folderPath = folder === "Inbox" ? "inbox" : folder;
+
+  const folderRef = buildFolderRef(folder);
+
+  // Build date filter AppleScript code
+  let dateFilterSetup = "";
+  let dateFilterCheck = "";
+
+  if (startDate || endDate) {
+    if (startDate) {
+      // Parse date string directly to avoid timezone issues
+      // Input format: "YYYY-MM-DD"
+      const [year, month, day] = startDate.split('-').map(Number);
+      // AppleScript requires 12-hour format with AM/PM
+      dateFilterSetup += `set filterStartDate to date "${month}/${day}/${year} 12:00:00 AM"\n`;
+    }
+    if (endDate) {
+      // Parse date string directly to avoid timezone issues
+      // Input format: "YYYY-MM-DD"
+      const [year, month, day] = endDate.split('-').map(Number);
+      // Set to end of day - AppleScript requires 12-hour format with AM/PM
+      dateFilterSetup += `set filterEndDate to date "${month}/${day}/${year} 11:59:59 PM"\n`;
+    }
+
+    // Build the date check condition
+    const startCheck = startDate ? "msgSentDate >= filterStartDate" : "";
+    const endCheck = endDate ? "msgSentDate <= filterEndDate" : "";
+    const dateChecks = [startCheck, endCheck].filter(c => c).join(" and ");
+    dateFilterCheck = `
+              set msgSentDate to time sent of theMsg
+              if not (${dateChecks}) then
+                -- Skip this message, outside date range
+              else`;
+  }
+
   const script = `
     tell application "Microsoft Outlook"
       try
-        set theFolder to ${folderPath}
-        set searchResults to {}
-        set allMessages to messages of theFolder
-        set i to 0
         set searchString to "${searchTerm.replace(/"/g, '\\"')}"
-        
-        repeat with theMessage in allMessages
-          if (subject of theMessage contains searchString) or (content of theMessage contains searchString) then
-            set i to i + 1
-            set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
-                       date:time sent of theMessage, id:id of theMessage}
-            
-            -- Try to get content
+        set messageOutput to ""
+        set totalFound to 0
+        ${dateFilterSetup}
+
+        -- Search only the specified folder
+        set theFolder to ${folderRef}
+        set folderMsgs to messages of theFolder
+
+        repeat with theMsg in folderMsgs
+          if totalFound >= ${limit} then exit repeat
+
+          try
+            ${dateFilterCheck}
+            set msgSubject to subject of theMsg
+            set msgContent to ""
+
+            -- Get plain text content
             try
-              set msgContent to content of theMessage
-              if length of msgContent > 500 then
-                set msgContent to (text 1 thru 500 of msgContent) & "..."
-              end if
-              set msgData to msgData & {content:msgContent}
+              set msgContent to plain text content of theMsg
             on error
-              set msgData to msgData & {content:"[Content not available]"}
+              try
+                set msgContent to content of theMsg
+              on error
+                set msgContent to "[Content not available]"
+              end try
             end try
-            
-            set end of searchResults to msgData
-            
-            -- Stop if we've reached the limit
-            if i >= ${limit} then
-              exit repeat
+
+            -- Check if search term is in subject or content (AppleScript 'contains' is case-insensitive)
+            if (msgSubject contains searchString) or (msgContent contains searchString) then
+              -- Get message ID
+              set msgId to id of theMsg as string
+
+              -- Get sender info
+              set msgSender to "Unknown"
+              try
+                set senderObj to sender of theMsg
+                if class of senderObj is text then
+                  set msgSender to senderObj
+                else
+                  try
+                    set msgSender to address of senderObj
+                  on error
+                    try
+                      set msgSender to name of senderObj
+                    on error
+                      set msgSender to senderObj as text
+                    end try
+                  end try
+                end if
+              end try
+
+              set msgDate to time sent of theMsg as string
+
+              -- Truncate content for output
+              if length of msgContent > 5000 then
+                set msgContent to (text 1 thru 5000 of msgContent) & "..."
+              end if
+
+              -- Build output with delimiters
+              set messageOutput to messageOutput & "<<<MSG>>>" & msgSubject & "<<<ID>>>" & msgId & "<<<FROM>>>" & msgSender & "<<<DATE>>>" & msgDate & "<<<CONTENT>>>" & msgContent & "<<<ENDMSG>>>"
+              set totalFound to totalFound + 1
             end if
-          end if
+            ${dateFilterCheck ? "end if" : ""}
+          end try
         end repeat
-        
-        return searchResults
+
+        return messageOutput
       on error errMsg
         return "Error: " & errMsg
       end try
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[searchEmails] Raw result length: ${result.length}`);
-    
-    // Parse the results
+
     if (result.startsWith("Error:")) {
       throw new Error(result);
     }
-    
-    // Parse the emails similar to unread emails
-    const emails = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const email: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              email[key] = value;
-            }
-          });
-          
-          if (email.subject || email.sender) {
-            emails.push({
-              subject: email.subject || "No subject",
-              sender: email.sender || "Unknown sender",
-              dateSent: email.date || new Date().toString(),
-              content: email.content || "[Content not available]",
-              id: email.id || ""
-            });
-          }
-        } catch (parseError) {
-          console.error('[searchEmails] Error parsing email match:', parseError);
-        }
-      }
-    }
-    
+
+    // Parse messages using helper function
+    const emails = parseEmailOutput(result);
+
     console.error(`[searchEmails] Found ${emails.length} matching emails`);
     return emails;
   } catch (error) {
@@ -422,95 +541,6 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
   }
 }
 
-async function checkAttachmentPath(filePath: string): Promise<string> {
-  try {
-    // Convert to absolute path if relative
-    let fullPath = filePath;
-    if (!filePath.startsWith('/')) {
-      const cwd = process.cwd();
-      fullPath = `${cwd}/${filePath}`;
-    }
-    
-    // Check if the file exists and is readable
-    const fs = require('fs');
-    const { promisify } = require('util');
-    const access = promisify(fs.access);
-    const stat = promisify(fs.stat);
-    
-    try {
-      await access(fullPath, fs.constants.R_OK);
-      const stats = await stat(fullPath);
-      
-      return `File exists and is readable: ${fullPath}\nSize: ${stats.size} bytes\nPermissions: ${stats.mode.toString(8)}\nLast modified: ${stats.mtime}`;
-    } catch (err) {
-      return `ERROR: Cannot access file: ${fullPath}\nError details: ${err.message}`;
-    }
-  } catch (error) {
-    return `Failed to check attachment path: ${error.message}`;
-  }
-}
-
-// Add a debug version of sending email with attachment to test if files are accessible
-async function debugSendEmailWithAttachment(
-  to: string,
-  subject: string,
-  body: string,
-  attachmentPath: string
-): Promise<string> {
-  // First check if the file exists and is readable
-  const fileStatus = await checkAttachmentPath(attachmentPath);
-  console.error(`[debugSendEmail] Attachment status: ${fileStatus}`);
-  
-  // Create a simple AppleScript that just attempts to open the file
-  const script = `
-    set theFile to POSIX file "${attachmentPath.replace(/"/g, '\\"')}"
-    try
-      tell application "Finder"
-        set fileExists to exists file theFile
-        set fileInfo to info for file theFile
-        return "File exists: " & fileExists & ", size: " & (size of fileInfo)
-      end tell
-    on error errMsg
-      return "Error accessing file: " & errMsg
-    end try
-  `;
-  
-  try {
-    const result = await runAppleScript(script);
-    console.error(`[debugSendEmail] AppleScript file check: ${result}`);
-    
-    // Now try to actually create a draft with the attachment
-    const emailScript = `
-      tell application "Microsoft Outlook"
-        try
-          set newMessage to make new outgoing message with properties {subject:"DEBUG: ${subject.replace(/"/g, '\\"')}", visible:true}
-          set content of newMessage to "${body.replace(/"/g, '\\"')}"
-          set to recipients of newMessage to {"${to}"}
-          
-          try
-            set attachmentFile to POSIX file "${attachmentPath.replace(/"/g, '\\"')}"
-            make new attachment at newMessage with properties {file:attachmentFile}
-            set attachResult to "Successfully attached file"
-          on error attachErrMsg
-            set attachResult to "Failed to attach file: " & attachErrMsg
-          end try
-          
-          return attachResult
-        on error errMsg
-          return "Error creating email: " & errMsg
-        end try
-      end tell
-    `;
-    
-    const attachResult = await runAppleScript(emailScript);
-    console.error(`[debugSendEmail] Attachment result: ${attachResult}`);
-    
-    return `File check: ${fileStatus}\n\nAttachment test: ${attachResult}`;
-  } catch (error) {
-    console.error("[debugSendEmail] Error during debug:", error);
-    return `Debugging error: ${error.message}\n\nFile check: ${fileStatus}`;
-  }
-}
 // Update the sendEmail function to handle attachments and HTML content
 async function sendEmail(
   to: string, 
@@ -537,13 +567,22 @@ async function sendEmail(
 
   // Get name for display
   const toName = extractNameFromEmail(to);
-  const ccName = cc ? extractNameFromEmail(cc) : "";
-  const bccName = bcc ? extractNameFromEmail(bcc) : "";
 
-  // Escape special characters
+  // Parse multiple recipients (comma-separated)
+  const parseRecipients = (recipientStr: string): Array<{name: string, address: string}> => {
+    return recipientStr.split(',').map(email => {
+      const trimmed = email.trim();
+      return { name: extractNameFromEmail(trimmed), address: trimmed };
+    });
+  };
+
+  const ccRecipients = cc ? parseRecipients(cc) : [];
+  const bccRecipients = bcc ? parseRecipients(bcc) : [];
+
+  // Escape special characters for AppleScript
   const escapedSubject = subject.replace(/"/g, '\\"');
-  const escapedBody = body.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-  
+  const escapedBody = body.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
   // Process attachments: Convert to absolute paths if they are relative
   let processedAttachments: string[] = [];
   if (attachments && attachments.length > 0) {
@@ -582,18 +621,17 @@ async function sendEmail(
         try
           set msg to make new outgoing message with properties {subject:"${escapedSubject}"}
           
-          ${isHtml ? 
-            `set content type of msg to HTML
-             set content of msg to "${escapedBody}"` 
-          : 
+          ${isHtml ?
             `set content of msg to "${escapedBody}"`
+          :
+            `set plain text content of msg to "${escapedBody}"`
           }
           
           tell msg
             set recipTo to make new to recipient with properties {email address:{name:"${toName}", address:"${to}"}}
-            ${cc ? `set recipCc to make new cc recipient with properties {email address:{name:"${ccName}", address:"${cc}"}}` : ''}
-            ${bcc ? `set recipBcc to make new bcc recipient with properties {email address:{name:"${bccName}", address:"${bcc}"}}` : ''}
-            
+            ${ccRecipients.map(r => `make new cc recipient with properties {email address:{name:"${r.name}", address:"${r.address}"}}`).join('\n            ')}
+            ${bccRecipients.map(r => `make new bcc recipient with properties {email address:{name:"${r.name}", address:"${r.address}"}}`).join('\n            ')}
+
             ${attachmentScript}
           end tell
           
@@ -629,11 +667,10 @@ async function sendEmail(
             set theMessage to item 1 of mail items of newDraft
             set subject of theMessage to "${escapedSubject}"
             
-            ${isHtml ? 
-              `set content type of theMessage to HTML
-               set content of theMessage to "${escapedBody}"` 
-            : 
+            ${isHtml ?
               `set content of theMessage to "${escapedBody}"`
+            :
+              `set plain text content of theMessage to "${escapedBody}"`
             }
             
             set to recipients of theMessage to {"${to}"}
@@ -683,11 +720,10 @@ async function sendEmail(
             try
               set newMessage to make new outgoing message with properties {subject:"${escapedSubject}", visible:true}
               
-              ${isHtml ? 
-                `set content type of newMessage to HTML
-                 set content of newMessage to "${escapedBody}"` 
-              : 
+              ${isHtml ?
                 `set content of newMessage to "${escapedBody}"`
+              :
+                `set plain text content of newMessage to "${escapedBody}"`
               }
               
               set to recipients of newMessage to {"${to}"}
@@ -732,6 +768,115 @@ async function sendEmail(
     }
   }
 }
+
+// Function to create a draft email (opens in Outlook for editing)
+async function createDraft(
+  to: string,
+  subject: string,
+  body: string,
+  cc?: string,
+  bcc?: string,
+  isHtml: boolean = false,
+  attachments?: string[]
+): Promise<string> {
+  console.error(`[createDraft] Creating draft to: ${to}, subject: "${subject}"`);
+  console.error(`[createDraft] Attachments: ${attachments ? JSON.stringify(attachments) : 'none'}`);
+
+  await checkOutlookAccess();
+
+  // Extract name from email if possible (for display name)
+  const extractNameFromEmail = (email: string): string => {
+    const namePart = email.split('@')[0];
+    return namePart
+      .split('.')
+      .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' ');
+  };
+
+  const toName = extractNameFromEmail(to);
+
+  // Parse multiple recipients (comma-separated)
+  const parseRecipients = (recipientStr: string): Array<{name: string, address: string}> => {
+    return recipientStr.split(',').map(email => {
+      const trimmed = email.trim();
+      return { name: extractNameFromEmail(trimmed), address: trimmed };
+    });
+  };
+
+  const ccRecipients = cc ? parseRecipients(cc) : [];
+  const bccRecipients = bcc ? parseRecipients(bcc) : [];
+
+  const escapedSubject = subject.replace(/"/g, '\\"');
+  const escapedBody = body.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+  // Process attachments
+  let processedAttachments: string[] = [];
+  if (attachments && attachments.length > 0) {
+    processedAttachments = attachments.map(path => {
+      if (path.startsWith('/')) {
+        return path;
+      }
+      const cwd = process.cwd();
+      return `${cwd}/${path}`;
+    });
+  }
+
+  const attachmentScript = processedAttachments.length > 0
+    ? processedAttachments.map(filePath => {
+      const escapedPath = filePath.replace(/"/g, '\\"');
+      return `
+        try
+          set attachmentFile to POSIX file "${escapedPath}"
+          make new attachment at newMessage with properties {file:attachmentFile}
+        on error errMsg
+          log "Failed to attach file: ${escapedPath} - Error: " & errMsg
+        end try
+      `;
+    }).join('\n')
+    : '';
+
+  const script = `
+    tell application "Microsoft Outlook"
+      try
+        set newMessage to make new outgoing message with properties {subject:"${escapedSubject}"}
+
+        ${isHtml ?
+          `set content of newMessage to "${escapedBody}"`
+        :
+          `set plain text content of newMessage to "${escapedBody}"`
+        }
+
+        tell newMessage
+          make new to recipient with properties {email address:{name:"${toName}", address:"${to}"}}
+          ${ccRecipients.map(r => `make new cc recipient with properties {email address:{name:"${r.name}", address:"${r.address}"}}`).join('\n          ')}
+          ${bccRecipients.map(r => `make new bcc recipient with properties {email address:{name:"${r.name}", address:"${r.address}"}}`).join('\n          ')}
+        end tell
+
+        ${attachmentScript}
+
+        -- Open the message window for editing
+        open newMessage
+
+        -- Bring Outlook to front
+        activate
+
+        return "Draft created and opened in Outlook"
+      on error errMsg
+        return "Error: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[createDraft] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[createDraft] Error creating draft:", error);
+    return `Error: ${error}`;
+  }
+}
+
 // Function to get mail folders - this works based on your logs
 async function getMailFolders(): Promise<string[]> {
     console.error("[getMailFolders] Getting mail folders");
@@ -759,77 +904,505 @@ async function getMailFolders(): Promise<string[]> {
       throw error;
     }
   }
-  
-  // Function to read emails in a folder that uses simple AppleScript
-async function readEmails(folder: string = "Inbox", limit: number = 10): Promise<any[]> {
-    console.error(`[readEmails] Reading emails from folder: ${folder}, limit: ${limit}`);
-    await checkOutlookAccess();
-    
-    // Use a simplified approach that should be more compatible
-    const script = `
+
+// Function to create a mail folder
+async function createFolder(name: string, parent?: string): Promise<string> {
+  console.error(`[createFolder] Creating folder: ${name}${parent ? ` under ${parent}` : ''}`);
+  await checkOutlookAccess();
+
+  let script: string;
+  if (parent) {
+    const parentRef = buildNestedFolderRef(parent);
+    script = `
       tell application "Microsoft Outlook"
         try
-          -- Get the folder by name safely
-          set targetFolder to null
-          set allFolders to mail folders
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${folder}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          
-          if targetFolder is null then set targetFolder to inbox
-          
-          -- Get messages
-          set messageList to {}
-          set msgCount to 0
-          set allMsgs to messages of targetFolder
-          
-          repeat with i from 1 to (count of allMsgs)
-            if msgCount >= ${limit} then exit repeat
-            
-            try
-              set theMsg to item i of allMsgs
-              set msgSubject to subject of theMsg
-              set msgSender to sender of theMsg
-              set msgDate to time sent of theMsg
-              
-              -- Create a simple text representation for the message
-              set msgInfo to msgSubject & " | " & msgSender & " | " & msgDate
-              set end of messageList to msgInfo
-              set msgCount to msgCount + 1
-            on error
-              -- Skip problematic messages
-            end try
-          end repeat
-          
-          return messageList
+          set parentFolder to ${parentRef}
+          set newFolder to make new mail folder at parentFolder with properties {name:"${escapeForAppleScript(name)}"}
+          return "Folder created: " & name of newFolder
         on error errMsg
           return "Error: " & errMsg
         end try
       end tell
     `;
-    
+  } else {
+    script = `
+      tell application "Microsoft Outlook"
+        try
+          set newFolder to make new mail folder with properties {name:"${escapeForAppleScript(name)}"}
+          return "Folder created: " & name of newFolder
+        on error errMsg
+          return "Error: " & errMsg
+        end try
+      end tell
+    `;
+  }
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[createFolder] Result: ${result}`);
+    if (result.startsWith("Error:")) {
+      return result;
+    }
+    return result;
+  } catch (error) {
+    console.error("[createFolder] Error creating folder:", error);
+    return `Error: ${error}`;
+  }
+}
+
+// Function to move an email to a folder
+async function moveEmail(messageId: string, targetFolder: string): Promise<string> {
+  console.error(`[moveEmail] Moving message ${messageId} to folder: ${targetFolder}`);
+  await checkOutlookAccess();
+
+  const folderRef = buildNestedFolderRef(targetFolder);
+
+  const script = `
+    tell application "Microsoft Outlook"
+      try
+        set theMsg to message id ${messageId}
+        set targetFolder to ${folderRef}
+        move theMsg to targetFolder
+        return "Email moved successfully to ${escapeForAppleScript(targetFolder)}"
+      on error errMsg
+        return "Error: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[moveEmail] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[moveEmail] Error moving email:", error);
+    return `Error: ${error}`;
+  }
+}
+
+// Function to forward an email
+async function forwardEmail(messageId: string, forwardTo: string, forwardCc?: string, forwardComment?: string, attachments?: string[], includeOriginalAttachments: boolean = true): Promise<string> {
+  console.error(`[forwardEmail] Forwarding message ${messageId} to: ${forwardTo}`);
+  console.error(`[forwardEmail] New attachments: ${attachments ? JSON.stringify(attachments) : 'none'}`);
+  console.error(`[forwardEmail] Include original attachments: ${includeOriginalAttachments}`);
+  await checkOutlookAccess();
+
+  const escapedComment = forwardComment ? escapeForAppleScript(forwardComment) : "";
+  const escapedTo = escapeForAppleScript(forwardTo);
+  const escapedCc = forwardCc ? escapeForAppleScript(forwardCc) : "";
+
+  // Process new attachments: Convert to absolute paths if they are relative
+  let processedAttachments: string[] = [];
+  if (attachments && attachments.length > 0) {
+    processedAttachments = attachments.map(path => {
+      if (path.startsWith('/')) {
+        return path;
+      }
+      const cwd = process.cwd();
+      return `${cwd}/${path}`;
+    });
+    console.error(`[forwardEmail] Processed attachments: ${JSON.stringify(processedAttachments)}`);
+  }
+
+  // Create script to add new attachments
+  const attachmentScript = processedAttachments.length > 0
+    ? processedAttachments.map(filePath => {
+      const escapedPath = filePath.replace(/"/g, '\\"');
+      return `
+        try
+          set attachmentFile to POSIX file "${escapedPath}"
+          make new attachment at fwdMsg with properties {file:attachmentFile}
+        on error errMsg
+          log "Failed to attach file: ${escapedPath} - Error: " & errMsg
+        end try
+      `;
+    }).join('\n')
+    : '';
+
+  // Script to remove original attachments if requested
+  const removeOriginalAttachmentsScript = !includeOriginalAttachments ? `
+        -- Remove original attachments from forwarded message
+        try
+          set attachmentCount to count of attachments of fwdMsg
+          repeat while attachmentCount > 0
+            delete attachment 1 of fwdMsg
+            set attachmentCount to attachmentCount - 1
+          end repeat
+        on error errMsg
+          log "Note: Could not remove original attachments - " & errMsg
+        end try
+  ` : '';
+
+  const script = `
+    tell application "Microsoft Outlook"
+      try
+        set theMsg to message id ${messageId}
+        set fwdMsg to forward theMsg without opening window
+
+        -- Add recipient
+        tell fwdMsg
+          make new to recipient with properties {email address:{address:"${escapedTo}"}}
+          ${forwardCc ? `make new cc recipient with properties {email address:{address:"${escapedCc}"}}` : ''}
+        end tell
+
+        ${removeOriginalAttachmentsScript}
+
+        -- Add new attachments if provided
+        ${attachmentScript}
+
+        -- Add comment above forwarded content if provided
+        ${forwardComment ? `
+        set currentContent to content of fwdMsg
+        set content of fwdMsg to "${escapedComment}" & return & return & currentContent
+        ` : ''}
+
+        -- Send the forward
+        send fwdMsg
+
+        return "Email forwarded successfully to ${escapedTo}${processedAttachments.length > 0 ? ` with ${processedAttachments.length} new attachment(s)` : ''}${!includeOriginalAttachments ? ' (original attachments removed)' : ''}"
+      on error errMsg
+        return "Error: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[forwardEmail] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[forwardEmail] Error forwarding email:", error);
+    return `Error: ${error}`;
+  }
+}
+
+// Function to reply to an email (preserves thread)
+async function replyEmail(messageId: string, replyBody: string, replyAll: boolean = false, isHtml: boolean = false, attachments?: string[]): Promise<string> {
+  console.error(`[replyEmail] Replying to message ${messageId}, replyAll: ${replyAll}, isHtml: ${isHtml}`);
+  console.error(`[replyEmail] Attachments: ${attachments ? JSON.stringify(attachments) : 'none'}`);
+  await checkOutlookAccess();
+
+  const escapedBody = escapeForAppleScript(replyBody);
+  const replyCommand = replyAll ? "reply to theMsg with reply to all" : "reply to theMsg";
+
+  // Process attachments: Convert to absolute paths if they are relative
+  let processedAttachments: string[] = [];
+  if (attachments && attachments.length > 0) {
+    processedAttachments = attachments.map(path => {
+      if (path.startsWith('/')) {
+        return path;
+      }
+      const cwd = process.cwd();
+      return `${cwd}/${path}`;
+    });
+    console.error(`[replyEmail] Processed attachments: ${JSON.stringify(processedAttachments)}`);
+  }
+
+  // Create attachment script part
+  const attachmentScript = processedAttachments.length > 0
+    ? processedAttachments.map(filePath => {
+      const escapedPath = filePath.replace(/"/g, '\\"');
+      return `
+        try
+          set attachmentFile to POSIX file "${escapedPath}"
+          make new attachment at replyMsg with properties {file:attachmentFile}
+        on error errMsg
+          log "Failed to attach file: ${escapedPath} - Error: " & errMsg
+        end try
+      `;
+    }).join('\n')
+    : '';
+
+  const script = `
+    tell application "Microsoft Outlook"
+      try
+        set theMsg to message id ${messageId}
+        set replyMsg to ${replyCommand} without opening window
+
+        -- Set the reply content (prepend to existing quoted content)
+        ${isHtml ? `
+        set currentContent to content of replyMsg
+        set content of replyMsg to "${escapedBody}" & "<br><br>" & currentContent
+        ` : `
+        set currentContent to plain text content of replyMsg
+        set plain text content of replyMsg to "${escapedBody}" & return & return & currentContent
+        `}
+
+        -- Add attachments if provided
+        ${attachmentScript}
+
+        -- Send the reply
+        send replyMsg
+
+        return "Reply sent successfully${processedAttachments.length > 0 ? ` with ${processedAttachments.length} attachment(s)` : ''}"
+      on error errMsg
+        return "Error: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[replyEmail] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[replyEmail] Error replying to email:", error);
+    return `Error: ${error}`;
+  }
+}
+
+// Function to rename a folder
+async function renameFolder(folder: string, newName: string): Promise<string> {
+  console.error(`[renameFolder] Renaming folder: ${folder} to ${newName}`);
+  await checkOutlookAccess();
+
+  const folderRef = buildNestedFolderRef(folder);
+
+  const script = `
+    tell application "Microsoft Outlook"
+      try
+        set theFolder to ${folderRef}
+        set name of theFolder to "${escapeForAppleScript(newName)}"
+        return "Folder renamed to: ${escapeForAppleScript(newName)}"
+      on error errMsg
+        return "Error: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[renameFolder] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[renameFolder] Error renaming folder:", error);
+    return `Error: ${error}`;
+  }
+}
+
+// Function to delete a folder
+async function deleteFolder(folder: string): Promise<string> {
+  console.error(`[deleteFolder] Deleting folder: ${folder}`);
+  await checkOutlookAccess();
+
+  const folderRef = buildNestedFolderRef(folder);
+
+  const script = `
+    tell application "Microsoft Outlook"
+      try
+        set theFolder to ${folderRef}
+        set msgCount to count of messages of theFolder
+        if msgCount > 0 then
+          return "Error: Folder contains " & msgCount & " email(s). Move or delete emails first."
+        end if
+        delete theFolder
+        return "Folder deleted: ${escapeForAppleScript(folder)}"
+      on error errMsg
+        return "Error: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[deleteFolder] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[deleteFolder] Error deleting folder:", error);
+    return `Error: ${error}`;
+  }
+}
+
+// Function to count emails in a folder
+async function countEmails(folder: string = "Inbox"): Promise<string> {
+  console.error(`[countEmails] Counting emails in folder: ${folder}`);
+  await checkOutlookAccess();
+
+  const folderRef = buildFolderRef(folder);
+
+  const script = `
+    tell application "Microsoft Outlook"
+      try
+        set theFolder to ${folderRef}
+        set totalCount to count of messages of theFolder
+        set unreadCount to count of (messages of theFolder whose is read is false)
+        return "Total: " & totalCount & ", Unread: " & unreadCount
+      on error errMsg
+        return "Error: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[countEmails] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[countEmails] Error counting emails:", error);
+    return `Error: ${error}`;
+  }
+}
+
+// Function to save attachments from an email to a destination folder
+async function saveAttachments(messageId: string, destinationFolder: string): Promise<string> {
+  console.error(`[saveAttachments] Saving attachments from message ${messageId} to ${destinationFolder}`);
+  await checkOutlookAccess();
+
+  const escapedDestination = destinationFolder.replace(/"/g, '\\"');
+
+  const script = `
+    tell application "Microsoft Outlook"
+      try
+        set theMsg to message id ${messageId}
+        set theAttachments to attachments of theMsg
+        set attachmentCount to count of theAttachments
+
+        if attachmentCount is 0 then
+          return "No attachments found in this email"
+        end if
+
+        set savedFiles to {}
+        repeat with theAttachment in theAttachments
+          set fileName to name of theAttachment
+          set filePath to "${escapedDestination}/" & fileName
+          save theAttachment in POSIX file filePath
+          set end of savedFiles to fileName
+        end repeat
+
+        return "Saved " & attachmentCount & " attachment(s): " & (savedFiles as string)
+      on error errMsg
+        return "Error: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[saveAttachments] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[saveAttachments] Error saving attachments:", error);
+    return `Error: ${error}`;
+  }
+}
+
+  // Function to read emails in a folder that uses simple AppleScript
+async function readEmails(folder: string = "Inbox", limit: number = 10, startDate?: string, endDate?: string): Promise<any[]> {
+    console.error(`[readEmails] Reading emails from folder: ${folder}, limit: ${limit}, startDate: ${startDate}, endDate: ${endDate}`);
+    await checkOutlookAccess();
+
+    const folderRef = buildFolderRef(folder);
+
+    // Build date filter AppleScript code
+    let dateFilterSetup = "";
+    let dateFilterCheck = "";
+    let dateFilterEndIf = "";
+
+    if (startDate || endDate) {
+      if (startDate) {
+        // Parse date string directly to avoid timezone issues
+        // Input format: "YYYY-MM-DD"
+        const [year, month, day] = startDate.split('-').map(Number);
+        // AppleScript requires 12-hour format with AM/PM
+        const startDateStr = `${month}/${day}/${year} 12:00:00 AM`;
+        console.error(`[readEmails] Start date filter: ${startDateStr}`);
+        dateFilterSetup += `set filterStartDate to date "${startDateStr}"\n`;
+      }
+      if (endDate) {
+        // Parse date string directly to avoid timezone issues
+        // Input format: "YYYY-MM-DD"
+        const [year, month, day] = endDate.split('-').map(Number);
+        // Set to end of day - AppleScript requires 12-hour format with AM/PM
+        const endDateStr = `${month}/${day}/${year} 11:59:59 PM`;
+        console.error(`[readEmails] End date filter: ${endDateStr}`);
+        dateFilterSetup += `set filterEndDate to date "${endDateStr}"\n`;
+      }
+
+      const startCheck = startDate ? "msgSentDate >= filterStartDate" : "";
+      const endCheck = endDate ? "msgSentDate <= filterEndDate" : "";
+      const dateChecks = [startCheck, endCheck].filter(c => c).join(" and ");
+      dateFilterCheck = `
+              set msgSentDate to time sent of theMsg
+              if (${dateChecks}) then`;
+      dateFilterEndIf = "end if";
+    }
+
+    const script = `
+      tell application "Microsoft Outlook"
+        try
+          set theFolder to ${folderRef}
+          set allMessages to messages of theFolder
+          set msgCount to count of allMessages
+          ${dateFilterSetup}
+
+          set messageOutput to ""
+          set foundCount to 0
+
+          repeat with i from 1 to msgCount
+            if foundCount >= ${limit} then exit repeat
+            try
+              set theMsg to item i of allMessages
+              ${dateFilterCheck}
+              set msgId to id of theMsg as string
+              set msgSubject to subject of theMsg
+
+              -- Get sender
+              set msgSender to "Unknown"
+              try
+                set senderObj to sender of theMsg
+                if class of senderObj is text then
+                  set msgSender to senderObj
+                else
+                  try
+                    set msgSender to address of senderObj
+                  on error
+                    try
+                      set msgSender to name of senderObj
+                    on error
+                      set msgSender to senderObj as text
+                    end try
+                  end try
+                end if
+              end try
+
+              set msgDate to time sent of theMsg as string
+
+              -- Get content (truncated)
+              set msgContent to ""
+              try
+                set msgContent to content of theMsg
+                if length of msgContent > 5000 then
+                  set msgContent to (text 1 thru 5000 of msgContent) & "..."
+                end if
+              on error
+                set msgContent to "[Content not available]"
+              end try
+
+              set messageOutput to messageOutput & "<<<MSG>>>" & msgSubject & "<<<ID>>>" & msgId & "<<<FROM>>>" & msgSender & "<<<DATE>>>" & msgDate & "<<<CONTENT>>>" & msgContent & "<<<ENDMSG>>>"
+              set foundCount to foundCount + 1
+              ${dateFilterEndIf}
+            end try
+          end repeat
+
+          return messageOutput
+        on error errMsg
+          return "Error: " & errMsg
+        end try
+      end tell
+    `;
+
     try {
       const result = await runAppleScript(script);
-      
+      console.error(`[readEmails] AppleScript result length: ${result.length}`);
+
       if (result.startsWith("Error:")) {
         throw new Error(result);
       }
-      
-      // Parse the results in a simple format
-      const emails = result.split(", ").map(msgInfo => {
-        const parts = msgInfo.split(" | ");
-        return {
-          subject: parts[0] || "No subject",
-          sender: parts[1] || "Unknown sender",
-          dateSent: parts[2] || new Date().toString(),
-          content: "Content not retrieved in simple mode"
-        };
-      });
-      
-      console.error(`[readEmails] Found ${emails.length} emails using simplified approach`);
+
+      // Parse messages using helper function
+      const emails = parseEmailOutput(result);
+
+      console.error(`[readEmails] Successfully parsed ${emails.length} emails from ${folder}`);
       return emails;
     } catch (error) {
       console.error("[readEmails] Error reading emails:", error);
@@ -849,58 +1422,67 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
   const script = `
     tell application "Microsoft Outlook"
       set todayEvents to {}
-      set theCalendar to default calendar
+
+      -- Find the calendar with the most events (main calendar)
+      set allCals to every calendar
+      set theCalendar to item 1 of allCals
+      set maxEvents to 0
+      repeat with cal in allCals
+        set eventCount to count of (every calendar event of cal)
+        if eventCount > maxEvents then
+          set maxEvents to eventCount
+          set theCalendar to cal
+        end if
+      end repeat
+
       set todayDate to current date
       set startOfDay to todayDate - (time of todayDate)
       set endOfDay to startOfDay + 1 * days
-      
-      set eventList to events of theCalendar whose start time is greater than or equal to startOfDay and start time is less than endOfDay
-      
-      set eventCount to count of eventList
-      set limitCount to ${limit}
-      
-      if eventCount < limitCount then
-        set limitCount to eventCount
-      end if
-      
-      repeat with i from 1 to limitCount
-        set theEvent to item i of eventList
-        set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
-                     location:location of theEvent, ¬
-                     id:id of theEvent}
-        
-        set end of todayEvents to eventData
+      set allEvents to every calendar event of theCalendar
+      set limitCount to 0
+
+      repeat with theEvent in allEvents
+        set eventStart to start time of theEvent
+        if eventStart >= startOfDay and eventStart < endOfDay then
+          set limitCount to limitCount + 1
+          set eventData to {subject:subject of theEvent, ¬
+                       start:eventStart, ¬
+                       |end|:end time of theEvent, ¬
+                       location:location of theEvent, ¬
+                       id:id of theEvent}
+          set end of todayEvents to eventData
+          if limitCount >= ${limit} then
+            exit repeat
+          end if
+        end if
       end repeat
-      
+
       return todayEvents
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[getTodayEvents] Raw result length: ${result.length}`);
-    
-    // Parse the results
+
+    // Parse the results - split by ", subject:" to separate events
     const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
+    if (result && result.includes('subject:')) {
+      const eventStrings = result.split(/, subject:/).map((s, i) => i === 0 ? s : 'subject:' + s);
+
+      for (const eventStr of eventStrings) {
         try {
-          const props = match.substring(1, match.length - 1).split(',');
           const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
+          const parts = eventStr.split(/, (?=subject:|start:|end:|location:|id:)/i);
+          for (const part of parts) {
+            const colonIdx = part.indexOf(':');
+            if (colonIdx > 0) {
+              const key = part.substring(0, colonIdx).trim().toLowerCase();
+              const value = part.substring(colonIdx + 1).trim();
               event[key] = value;
             }
-          });
-          
+          }
+
           if (event.subject) {
             events.push({
               subject: event.subject,
@@ -911,11 +1493,11 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
             });
           }
         } catch (parseError) {
-          console.error('[getTodayEvents] Error parsing event match:', parseError);
+          console.error('[getTodayEvents] Error parsing event:', parseError);
         }
       }
     }
-    
+
     console.error(`[getTodayEvents] Found ${events.length} events for today`);
     return events;
   } catch (error) {
@@ -932,31 +1514,40 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
   const script = `
     tell application "Microsoft Outlook"
       set upcomingEvents to {}
-      set theCalendar to default calendar
-      set todayDate to current date
-      set startOfToday to todayDate - (time of todayDate)
-      set endDate to startOfToday + ${days} * days
-      
-      set eventList to events of theCalendar whose start time is greater than or equal to todayDate and start time is less than endDate
-      
-      set eventCount to count of eventList
-      set limitCount to ${limit}
-      
-      if eventCount < limitCount then
-        set limitCount to eventCount
-      end if
-      
-      repeat with i from 1 to limitCount
-        set theEvent to item i of eventList
-        set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
-                     location:location of theEvent, ¬
-                     id:id of theEvent}
-        
-        set end of upcomingEvents to eventData
+
+      -- Find the calendar with the most events (main calendar)
+      set allCals to every calendar
+      set theCalendar to item 1 of allCals
+      set maxEvents to 0
+      repeat with cal in allCals
+        set eventCount to count of (every calendar event of cal)
+        if eventCount > maxEvents then
+          set maxEvents to eventCount
+          set theCalendar to cal
+        end if
       end repeat
-      
+
+      set todayDate to current date
+      set endDate to todayDate + ${days} * days
+      set allEvents to every calendar event of theCalendar
+      set limitCount to 0
+
+      repeat with theEvent in allEvents
+        set eventStart to start time of theEvent
+        if eventStart >= todayDate and eventStart < endDate then
+          set limitCount to limitCount + 1
+          set eventData to {subject:subject of theEvent, ¬
+                       start:eventStart, ¬
+                       |end|:end time of theEvent, ¬
+                       location:location of theEvent, ¬
+                       id:id of theEvent}
+          set end of upcomingEvents to eventData
+          if limitCount >= ${limit} then
+            exit repeat
+          end if
+        end if
+      end repeat
+
       return upcomingEvents
     end tell
   `;
@@ -964,41 +1555,49 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
   try {
     const result = await runAppleScript(script);
     console.error(`[getUpcomingEvents] Raw result length: ${result.length}`);
-    
-    // Parse the results
+
+    // Parse the results - split by ", subject:" to separate events
     const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
+    if (result && result.includes('subject:')) {
+      const eventStrings = result.split(/, subject:/).map((s, i) => i === 0 ? s : 'subject:' + s);
+
+      for (const eventStr of eventStrings) {
         try {
-          const props = match.substring(1, match.length - 1).split(',');
           const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              event[key] = value;
+          // Parse key:value pairs, handling colons in values (like times)
+          const keyValuePattern = /(subject|start|end|location|id):([^,]*(?:,[^a-z]*)?)/gi;
+          let match;
+
+          // Simple parsing: split by known keys
+          const parts = eventStr.split(/, (?=subject:|start:|end:|location:|id:)/i);
+          for (const part of parts) {
+            const colonIdx = part.indexOf(':');
+            if (colonIdx > 0) {
+              const key = part.substring(0, colonIdx).trim().toLowerCase();
+              const value = part.substring(colonIdx + 1).trim();
+              if (key === 'end') {
+                event['end'] = value;
+              } else {
+                event[key] = value;
+              }
             }
-          });
-          
+          }
+
           if (event.subject) {
             events.push({
               subject: event.subject,
               start: event.start,
-              end: event.end,
+              end: event.end || event['|end|'],
               location: event.location || "No location",
               id: event.id
             });
           }
         } catch (parseError) {
-          console.error('[getUpcomingEvents] Error parsing event match:', parseError);
+          console.error('[getUpcomingEvents] Error parsing event:', parseError);
         }
       }
     }
-    
+
     console.error(`[getUpcomingEvents] Found ${events.length} upcoming events`);
     return events;
   } catch (error) {
@@ -1015,29 +1614,41 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
   const script = `
     tell application "Microsoft Outlook"
       set searchResults to {}
-      set theCalendar to default calendar
-      set allEvents to events of theCalendar
+
+      -- Find the calendar with the most events (main calendar)
+      set allCals to every calendar
+      set theCalendar to item 1 of allCals
+      set maxEvents to 0
+      repeat with cal in allCals
+        set eventCount to count of (every calendar event of cal)
+        if eventCount > maxEvents then
+          set maxEvents to eventCount
+          set theCalendar to cal
+        end if
+      end repeat
+
+      set allEvents to every calendar event of theCalendar
       set i to 0
       set searchString to "${searchTerm.replace(/"/g, '\\"')}"
-      
+
       repeat with theEvent in allEvents
         if (subject of theEvent contains searchString) or (location of theEvent contains searchString) then
           set i to i + 1
           set eventData to {subject:subject of theEvent, ¬
                        start:start time of theEvent, ¬
-                       end:end time of theEvent, ¬
+                       |end|:end time of theEvent, ¬
                        location:location of theEvent, ¬
                        id:id of theEvent}
-          
+
           set end of searchResults to eventData
-          
+
           -- Stop if we've reached the limit
           if i >= ${limit} then
             exit repeat
           end if
         end if
       end repeat
-      
+
       return searchResults
     end tell
   `;
@@ -1045,26 +1656,25 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
   try {
     const result = await runAppleScript(script);
     console.error(`[searchEvents] Raw result length: ${result.length}`);
-    
-    // Parse the results
+
+    // Parse the results - split by ", subject:" to separate events
     const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
+    if (result && result.includes('subject:')) {
+      const eventStrings = result.split(/, subject:/).map((s, i) => i === 0 ? s : 'subject:' + s);
+
+      for (const eventStr of eventStrings) {
         try {
-          const props = match.substring(1, match.length - 1).split(',');
           const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
+          const parts = eventStr.split(/, (?=subject:|start:|end:|location:|id:)/i);
+          for (const part of parts) {
+            const colonIdx = part.indexOf(':');
+            if (colonIdx > 0) {
+              const key = part.substring(0, colonIdx).trim().toLowerCase();
+              const value = part.substring(colonIdx + 1).trim();
               event[key] = value;
             }
-          });
-          
+          }
+
           if (event.subject) {
             events.push({
               subject: event.subject,
@@ -1075,11 +1685,11 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
             });
           }
         } catch (parseError) {
-          console.error('[searchEvents] Error parsing event match:', parseError);
+          console.error('[searchEvents] Error parsing event:', parseError);
         }
       }
     }
-    
+
     console.error(`[searchEvents] Found ${events.length} matching events`);
     return events;
   } catch (error) {
@@ -1096,31 +1706,52 @@ async function createEvent(subject: string, start: string, end: string, location
   // Parse the ISO date strings to a format AppleScript can understand
   const startDate = new Date(start);
   const endDate = new Date(end);
-  
-  // Format for AppleScript (month/day/year hour:minute:second)
-  const formattedStart = `date "${startDate.getMonth() + 1}/${startDate.getDate()}/${startDate.getFullYear()} ${startDate.getHours()}:${startDate.getMinutes()}:${startDate.getSeconds()}"`;
-  const formattedEnd = `date "${endDate.getMonth() + 1}/${endDate.getDate()}/${endDate.getFullYear()} ${endDate.getHours()}:${endDate.getMinutes()}:${endDate.getSeconds()}"`;
+
+  // Format for AppleScript: "M/D/YYYY H:MM:SS AM/PM" (12-hour format required)
+  const formatForAppleScript = (d: Date): string => {
+    const month = d.getMonth() + 1;
+    const day = d.getDate();
+    const year = d.getFullYear();
+    let hours = d.getHours();
+    const minutes = d.getMinutes().toString().padStart(2, '0');
+    const seconds = d.getSeconds().toString().padStart(2, '0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12;
+    if (hours === 0) hours = 12; // 0 becomes 12 for 12-hour format
+    return `date "${month}/${day}/${year} ${hours}:${minutes}:${seconds} ${ampm}"`;
+  };
+  const formattedStart = formatForAppleScript(startDate);
+  const formattedEnd = formatForAppleScript(endDate);
   
   // Escape strings for AppleScript
   const escapedSubject = subject.replace(/"/g, '\\"');
   const escapedLocation = location ? location.replace(/"/g, '\\"') : "";
   const escapedBody = body ? body.replace(/"/g, '\\"') : "";
   
+  // Build properties object
+  let properties = `subject:"${escapedSubject}", start time:${formattedStart}, end time:${formattedEnd}`;
+  if (location) {
+    properties += `, location:"${escapedLocation}"`;
+  }
+  if (body) {
+    properties += `, content:"${escapedBody}"`;
+  }
+
   let script = `
     tell application "Microsoft Outlook"
-      set theCalendar to default calendar
-      set newEvent to make new calendar event at theCalendar with properties {subject:"${escapedSubject}", start time:${formattedStart}, end time:${formattedEnd}
-  `;
-  
-  if (location) {
-    script += `, location:"${escapedLocation}"`;
-  }
-  
-  if (body) {
-    script += `, content:"${escapedBody}"`;
-  }
-  
-  script += `}
+      -- Find the calendar with the most events (main calendar)
+      set allCals to every calendar
+      set theCalendar to item 1 of allCals
+      set maxEvents to 0
+      repeat with cal in allCals
+        set eventCount to count of (every calendar event of cal)
+        if eventCount > maxEvents then
+          set maxEvents to eventCount
+          set theCalendar to cal
+        end if
+      end repeat
+
+      set newEvent to make new calendar event of theCalendar with properties {${properties}}
   `;
   
   // Add attendees if provided
@@ -1136,8 +1767,7 @@ async function createEvent(subject: string, start: string, end: string, location
   }
   
   script += `
-      save newEvent
-      return "Event created successfully"
+      return "Event created: " & subject of newEvent
     end tell
   `;
   
@@ -1147,6 +1777,205 @@ async function createEvent(subject: string, start: string, end: string, location
     return result;
   } catch (error) {
     console.error("[createEvent] Error creating event:", error);
+    throw error;
+  }
+}
+
+// Function to delete a calendar event by subject and date
+async function deleteEvent(subject: string, dateStr: string): Promise<string> {
+  console.error(`[deleteEvent] Deleting event: "${subject}" on ${dateStr}`);
+  await checkOutlookAccess();
+
+  // Parse the date string (YYYY-MM-DD) to get month, day, year
+  const dateParts = dateStr.split('-');
+  const year = parseInt(dateParts[0]);
+  const month = parseInt(dateParts[1]);
+  const day = parseInt(dateParts[2]);
+
+  // Escape the subject for AppleScript
+  const escapedSubject = subject.replace(/"/g, '\\"');
+
+  const script = `
+    tell application "Microsoft Outlook"
+      set targetDate to date "${month}/${day}/${year}"
+      set startOfDay to targetDate
+      set time of startOfDay to 0
+      set endOfDay to targetDate + 1 * days
+
+      set deletedCount to 0
+      set allCals to every calendar
+
+      repeat with cal in allCals
+        set calEvents to (every calendar event of cal whose subject is "${escapedSubject}")
+        repeat with evt in calEvents
+          set evtStart to start time of evt
+          if evtStart ≥ startOfDay and evtStart < endOfDay then
+            delete evt
+            set deletedCount to deletedCount + 1
+          end if
+        end repeat
+      end repeat
+
+      if deletedCount > 0 then
+        return "Deleted " & deletedCount & " event(s) matching \\"${escapedSubject}\\" on ${month}/${day}/${year}"
+      else
+        return "No events found matching \\"${escapedSubject}\\" on ${month}/${day}/${year}"
+      end if
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[deleteEvent] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[deleteEvent] Error deleting event:", error);
+    throw error;
+  }
+}
+
+// Function to respond to a meeting invite (accept, decline, tentative)
+async function respondToMeeting(
+  subject: string,
+  dateStr: string,
+  response: "accept" | "decline" | "tentative"
+): Promise<string> {
+  console.error(`[respondToMeeting] ${response} meeting: "${subject}" on ${dateStr}`);
+  await checkOutlookAccess();
+
+  const dateParts = dateStr.split('-');
+  const year = parseInt(dateParts[0]);
+  const month = parseInt(dateParts[1]);
+  const day = parseInt(dateParts[2]);
+
+  const escapedSubject = subject.replace(/"/g, '\\"');
+
+  // Map response to Outlook AppleScript command
+  const responseCommand = response === "accept" ? "accept meeting"
+    : response === "decline" ? "decline meeting"
+    : "tentatively accept meeting";
+
+  const script = `
+    tell application "Microsoft Outlook"
+      set targetDate to date "${month}/${day}/${year}"
+      set startOfDay to targetDate
+      set time of startOfDay to 0
+      set endOfDay to targetDate + 1 * days
+
+      set respondedCount to 0
+      set allCals to every calendar
+
+      repeat with cal in allCals
+        set calEvents to (every calendar event of cal whose subject is "${escapedSubject}")
+        repeat with evt in calEvents
+          set evtStart to start time of evt
+          if evtStart ≥ startOfDay and evtStart < endOfDay then
+            try
+              ${responseCommand} evt
+              set respondedCount to respondedCount + 1
+            on error errMsg
+              -- Event might not be a meeting invite
+              return "Error: " & errMsg
+            end try
+          end if
+        end repeat
+      end repeat
+
+      if respondedCount > 0 then
+        return "${response === "accept" ? "Accepted" : response === "decline" ? "Declined" : "Tentatively accepted"} " & respondedCount & " meeting(s) matching \\"${escapedSubject}\\" on ${month}/${day}/${year}"
+      else
+        return "No meetings found matching \\"${escapedSubject}\\" on ${month}/${day}/${year}"
+      end if
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[respondToMeeting] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[respondToMeeting] Error responding to meeting:", error);
+    throw error;
+  }
+}
+
+// Function to propose a new time for a meeting
+async function proposeNewTime(
+  subject: string,
+  dateStr: string,
+  proposedStart: string,
+  proposedEnd: string
+): Promise<string> {
+  console.error(`[proposeNewTime] Proposing new time for: "${subject}" on ${dateStr}`);
+  await checkOutlookAccess();
+
+  const dateParts = dateStr.split('-');
+  const year = parseInt(dateParts[0]);
+  const month = parseInt(dateParts[1]);
+  const day = parseInt(dateParts[2]);
+
+  // Parse the proposed times
+  const startDate = new Date(proposedStart);
+  const endDate = new Date(proposedEnd);
+
+  // Format for AppleScript: "M/D/YYYY H:MM:SS AM/PM" (12-hour format required)
+  const formatForAppleScript = (d: Date): string => {
+    const m = d.getMonth() + 1;
+    const dy = d.getDate();
+    const yr = d.getFullYear();
+    let hours = d.getHours();
+    const minutes = d.getMinutes().toString().padStart(2, '0');
+    const seconds = d.getSeconds().toString().padStart(2, '0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12;
+    if (hours === 0) hours = 12;
+    return `date "${m}/${dy}/${yr} ${hours}:${minutes}:${seconds} ${ampm}"`;
+  };
+
+  const formattedProposedStart = formatForAppleScript(startDate);
+  const formattedProposedEnd = formatForAppleScript(endDate);
+
+  const escapedSubject = subject.replace(/"/g, '\\"');
+
+  const script = `
+    tell application "Microsoft Outlook"
+      set targetDate to date "${month}/${day}/${year}"
+      set startOfDay to targetDate
+      set time of startOfDay to 0
+      set endOfDay to targetDate + 1 * days
+
+      set proposedCount to 0
+      set allCals to every calendar
+
+      repeat with cal in allCals
+        set calEvents to (every calendar event of cal whose subject is "${escapedSubject}")
+        repeat with evt in calEvents
+          set evtStart to start time of evt
+          if evtStart ≥ startOfDay and evtStart < endOfDay then
+            try
+              propose new time evt proposed start time ${formattedProposedStart} proposed end time ${formattedProposedEnd}
+              set proposedCount to proposedCount + 1
+            on error errMsg
+              return "Error: " & errMsg
+            end try
+          end if
+        end repeat
+      end repeat
+
+      if proposedCount > 0 then
+        return "Proposed new time for " & proposedCount & " meeting(s) matching \\"${escapedSubject}\\""
+      else
+        return "No meetings found matching \\"${escapedSubject}\\" on ${month}/${day}/${year}"
+      end if
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[proposeNewTime] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[proposeNewTime] Error proposing new time:", error);
     throw error;
   }
 }
@@ -1451,10 +2280,12 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
 
 // Type guards for arguments
 function isMailArgs(args: unknown): args is {
-  operation: "unread" | "search" | "send" | "folders" | "read";
+  operation: "unread" | "search" | "send" | "draft" | "reply" | "forward" | "folders" | "read" | "create_folder" | "move_email" | "rename_folder" | "delete_folder" | "count" | "save_attachments";
   folder?: string;
   limit?: number;
   searchTerm?: string;
+  startDate?: string;
+  endDate?: string;
   to?: string;
   subject?: string;
   body?: string;
@@ -1462,15 +2293,27 @@ function isMailArgs(args: unknown): args is {
   cc?: string;
   bcc?: string;
   attachments?: string[];
+  name?: string;
+  parent?: string;
+  messageId?: string;
+  targetFolder?: string;
+  destinationFolder?: string;
+  newName?: string;
+  forwardTo?: string;
+  forwardCc?: string;
+  forwardComment?: string;
+  includeOriginalAttachments?: boolean;
+  replyBody?: string;
+  replyAll?: boolean;
 } {
   if (typeof args !== "object" || args === null) return false;
-  
+
   const { operation } = args as any;
-  
-  if (!operation || !["unread", "search", "send", "folders", "read"].includes(operation)) {
+
+  if (!operation || !["unread", "search", "send", "draft", "reply", "forward", "folders", "read", "create_folder", "move_email", "rename_folder", "delete_folder", "count", "save_attachments"].includes(operation)) {
     return false;
   }
-  
+
   // Check required fields based on operation
   switch (operation) {
     case "search":
@@ -1479,13 +2322,37 @@ function isMailArgs(args: unknown): args is {
     case "send":
       if (!(args as any).to || !(args as any).subject || !(args as any).body) return false;
       break;
+    case "draft":
+      if (!(args as any).to || !(args as any).subject || !(args as any).body) return false;
+      break;
+    case "reply":
+      if (!(args as any).messageId || !(args as any).replyBody) return false;
+      break;
+    case "forward":
+      if (!(args as any).messageId || !(args as any).forwardTo) return false;
+      break;
+    case "create_folder":
+      if (!(args as any).name) return false;
+      break;
+    case "move_email":
+      if (!(args as any).messageId || !(args as any).targetFolder) return false;
+      break;
+    case "rename_folder":
+      if (!(args as any).folder || !(args as any).newName) return false;
+      break;
+    case "delete_folder":
+      if (!(args as any).folder) return false;
+      break;
+    case "save_attachments":
+      if (!(args as any).messageId || !(args as any).destinationFolder) return false;
+      break;
   }
-  
+
   return true;
 }
 
 function isCalendarArgs(args: unknown): args is {
-  operation: "today" | "upcoming" | "search" | "create";
+  operation: "today" | "upcoming" | "search" | "create" | "delete" | "accept" | "decline" | "tentative" | "propose_new_time";
   searchTerm?: string;
   limit?: number;
   days?: number;
@@ -1495,15 +2362,21 @@ function isCalendarArgs(args: unknown): args is {
   location?: string;
   body?: string;
   attendees?: string;
+  deleteSubject?: string;
+  deleteDate?: string;
+  responseSubject?: string;
+  responseDate?: string;
+  proposedStart?: string;
+  proposedEnd?: string;
 } {
   if (typeof args !== "object" || args === null) return false;
-  
+
   const { operation } = args as any;
-  
-  if (!operation || !["today", "upcoming", "search", "create"].includes(operation)) {
+
+  if (!operation || !["today", "upcoming", "search", "create", "delete", "accept", "decline", "tentative", "propose_new_time"].includes(operation)) {
     return false;
   }
-  
+
   // Check required fields based on operation
   switch (operation) {
     case "search":
@@ -1512,8 +2385,20 @@ function isCalendarArgs(args: unknown): args is {
     case "create":
       if (!(args as any).subject || !(args as any).start || !(args as any).end) return false;
       break;
+    case "delete":
+      if (!(args as any).deleteSubject || !(args as any).deleteDate) return false;
+      break;
+    case "accept":
+    case "decline":
+    case "tentative":
+      if (!(args as any).responseSubject || !(args as any).responseDate) return false;
+      break;
+    case "propose_new_time":
+      if (!(args as any).responseSubject || !(args as any).responseDate ||
+          !(args as any).proposedStart || !(args as any).proposedEnd) return false;
+      break;
   }
-  
+
   return true;
 }
 
@@ -1589,16 +2474,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!args.searchTerm) {
               throw new Error("Search term is required for search operation");
             }
-            const emails = await searchEmails(args.searchTerm, args.folder, args.limit);
+            const emails = await searchEmails(args.searchTerm, args.folder, args.limit, args.startDate, args.endDate);
+            const dateRange = args.startDate || args.endDate
+              ? ` (${args.startDate || 'any'} to ${args.endDate || 'any'})`
+              : '';
             return {
-              content: [{ 
-                type: "text", 
-                text: emails.length > 0 ? 
-                  `Found ${emails.length} email(s) for "${args.searchTerm}"${args.folder ? ` in folder "${args.folder}"` : ''}\n\n` +
-                  emails.map(email => 
-                    `[${email.dateSent}] From: ${email.sender}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? '...' : ''}`
+              content: [{
+                type: "text",
+                text: emails.length > 0 ?
+                  `Found ${emails.length} email(s) for "${args.searchTerm}"${dateRange}\n\n` +
+                  emails.map((email, i) =>
+                    `--- Email ${i + 1} ---\nID: ${email.messageId || 'Unknown'}\nFrom: ${email.sender}\nDate: ${email.dateSent}\nSubject: ${email.subject}\n\n${email.content}`
                   ).join("\n\n") :
-                  `No emails found for "${args.searchTerm}"${args.folder ? ` in folder "${args.folder}"` : ''}`
+                  `No emails found for "${args.searchTerm}"${dateRange}`
               }],
               isError: false
             };
@@ -1633,13 +2521,70 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               isError: false
             };
           }
-          
+
+          case "draft": {
+            if (!args.to || !args.subject || !args.body) {
+              throw new Error("Recipient (to), subject, and body are required for draft operation");
+            }
+
+            // Validate attachments if provided
+            if (args.attachments && !Array.isArray(args.attachments)) {
+              throw new Error("Attachments must be an array of file paths");
+            }
+
+            console.error(`[CallTool] Create draft with attachments: ${args.attachments ? JSON.stringify(args.attachments) : 'none'}`);
+
+            const draftResult = await createDraft(
+              args.to,
+              args.subject,
+              args.body,
+              args.cc,
+              args.bcc,
+              args.isHtml || false,
+              args.attachments
+            );
+
+            return {
+              content: [{ type: "text", text: draftResult }],
+              isError: draftResult.startsWith("Error:")
+            };
+          }
+
+          case "reply": {
+            if (!args.messageId || !args.replyBody) {
+              throw new Error("Message ID and replyBody are required for reply operation");
+            }
+            const result = await replyEmail(args.messageId, args.replyBody, args.replyAll || false, args.isHtml || false, args.attachments);
+            return {
+              content: [{ type: "text", text: result }],
+              isError: result.startsWith("Error:")
+            };
+          }
+
+          case "forward": {
+            if (!args.messageId || !args.forwardTo) {
+              throw new Error("Message ID and forwardTo are required for forward operation");
+            }
+            const result = await forwardEmail(
+              args.messageId,
+              args.forwardTo,
+              args.forwardCc,
+              args.forwardComment,
+              args.attachments,
+              args.includeOriginalAttachments !== undefined ? args.includeOriginalAttachments : true
+            );
+            return {
+              content: [{ type: "text", text: result }],
+              isError: result.startsWith("Error:")
+            };
+          }
+
           case "folders": {
             const folders = await getMailFolders();
             return {
-              content: [{ 
-                type: "text", 
-                text: folders.length > 0 ? 
+              content: [{
+                type: "text",
+                text: folders.length > 0 ?
                   `Found ${folders.length} mail folders:\n\n${folders.join("\n")}` :
                   "No mail folders found. Make sure Outlook is running and properly configured."
               }],
@@ -1648,21 +2593,92 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           
           case "read": {
-            const emails = await readEmails(args.folder, args.limit);
+            console.error(`[MCP read] folder=${args.folder}, limit=${args.limit}, startDate=${args.startDate}, endDate=${args.endDate}`);
+            const emails = await readEmails(args.folder, args.limit, args.startDate, args.endDate);
+            const dateRange = args.startDate || args.endDate
+              ? ` (${args.startDate || 'any'} to ${args.endDate || 'any'})`
+              : '';
             return {
-              content: [{ 
-                type: "text", 
-                text: emails.length > 0 ? 
-                  `Found ${emails.length} email(s)${args.folder ? ` in folder "${args.folder}"` : ''}\n\n` +
-                  emails.map(email => 
-                    `[${email.dateSent}] From: ${email.sender}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? '...' : ''}`
+              content: [{
+                type: "text",
+                text: emails.length > 0 ?
+                  `Found ${emails.length} email(s)${args.folder ? ` in folder "${args.folder}"` : ''}${dateRange}\n\n` +
+                  emails.map(email =>
+                    `[${email.dateSent}] ID: ${email.messageId || 'Unknown'}\nFrom: ${email.sender}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? '...' : ''}`
                   ).join("\n\n") :
-                  `No emails found${args.folder ? ` in folder "${args.folder}"` : ''}`
+                  `No emails found${args.folder ? ` in folder "${args.folder}"` : ''}${dateRange}`
               }],
               isError: false
             };
           }
-          
+
+          case "create_folder": {
+            if (!args.name) {
+              throw new Error("Folder name is required for create_folder operation");
+            }
+            const result = await createFolder(args.name, args.parent);
+            return {
+              content: [{ type: "text", text: result }],
+              isError: result.startsWith("Error:")
+            };
+          }
+
+          case "move_email": {
+            if (!args.messageId || !args.targetFolder) {
+              throw new Error("Message ID and target folder are required for move_email operation");
+            }
+            const result = await moveEmail(args.messageId, args.targetFolder);
+            return {
+              content: [{ type: "text", text: result }],
+              isError: result.startsWith("Error:")
+            };
+          }
+
+          case "rename_folder": {
+            if (!args.folder || !args.newName) {
+              throw new Error("Folder and new name are required for rename_folder operation");
+            }
+            const result = await renameFolder(args.folder, args.newName);
+            return {
+              content: [{ type: "text", text: result }],
+              isError: result.startsWith("Error:")
+            };
+          }
+
+          case "delete_folder": {
+            if (!args.folder) {
+              throw new Error("Folder is required for delete_folder operation");
+            }
+            const result = await deleteFolder(args.folder);
+            return {
+              content: [{ type: "text", text: result }],
+              isError: result.startsWith("Error:")
+            };
+          }
+
+          case "count": {
+            const folder = args.folder || "Inbox";
+            const result = await countEmails(folder);
+            return {
+              content: [{ type: "text", text: `${folder}: ${result}` }],
+              isError: result.startsWith("Error:")
+            };
+          }
+
+          case "save_attachments": {
+            if (!args.messageId) {
+              throw new Error("messageId is required for save_attachments operation");
+            }
+            if (!args.destinationFolder) {
+              throw new Error("destinationFolder is required for save_attachments operation");
+            }
+            const result = await saveAttachments(args.messageId, args.destinationFolder);
+            return {
+              content: [{ type: "text", text: result }],
+              isError: result.startsWith("Error:")
+            };
+          }
+
           default:
             throw new Error(`Unknown mail operation: ${operation}`);
         }
@@ -1739,7 +2755,62 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               isError: false
             };
           }
-          
+
+          case "delete": {
+            if (!args.deleteSubject || !args.deleteDate) {
+              throw new Error("deleteSubject and deleteDate are required for delete operation");
+            }
+            const deleteResult = await deleteEvent(args.deleteSubject, args.deleteDate);
+            return {
+              content: [{ type: "text", text: deleteResult }],
+              isError: false
+            };
+          }
+
+          case "accept": {
+            if (!args.responseSubject || !args.responseDate) {
+              throw new Error("responseSubject and responseDate are required for accept operation");
+            }
+            const acceptResult = await respondToMeeting(args.responseSubject, args.responseDate, "accept");
+            return {
+              content: [{ type: "text", text: acceptResult }],
+              isError: false
+            };
+          }
+
+          case "decline": {
+            if (!args.responseSubject || !args.responseDate) {
+              throw new Error("responseSubject and responseDate are required for decline operation");
+            }
+            const declineResult = await respondToMeeting(args.responseSubject, args.responseDate, "decline");
+            return {
+              content: [{ type: "text", text: declineResult }],
+              isError: false
+            };
+          }
+
+          case "tentative": {
+            if (!args.responseSubject || !args.responseDate) {
+              throw new Error("responseSubject and responseDate are required for tentative operation");
+            }
+            const tentativeResult = await respondToMeeting(args.responseSubject, args.responseDate, "tentative");
+            return {
+              content: [{ type: "text", text: tentativeResult }],
+              isError: false
+            };
+          }
+
+          case "propose_new_time": {
+            if (!args.responseSubject || !args.responseDate || !args.proposedStart || !args.proposedEnd) {
+              throw new Error("responseSubject, responseDate, proposedStart, and proposedEnd are required for propose_new_time operation");
+            }
+            const proposeResult = await proposeNewTime(args.responseSubject, args.responseDate, args.proposedStart, args.proposedEnd);
+            return {
+              content: [{ type: "text", text: proposeResult }],
+              isError: false
+            };
+          }
+
           default:
             throw new Error(`Unknown calendar operation: ${operation}`);
         }
@@ -1815,7 +2886,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // ====================================================
-// 9. START SERVER
+// 9. EXPORTS FOR TESTING
+// ====================================================
+
+// Export functions for integration testing
+export {
+  readEmails,
+  searchEmails,
+  getUnreadEmails,
+  sendEmail,
+  createDraft,
+  replyEmail,
+  forwardEmail,
+  getMailFolders,
+  createFolder,
+  moveEmail,
+  renameFolder,
+  deleteFolder,
+  getTodayEvents,
+  getUpcomingEvents,
+  searchEvents,
+  createEvent,
+  listContacts,
+  searchContacts
+};
+
+// ====================================================
+// 10. START SERVER
 // ====================================================
 
 // Start the MCP server

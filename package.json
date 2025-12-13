@@ -18,7 +18,11 @@
     ],
     "scripts": {
       "dev": "bun run index.ts",
-      "start": "bun run index.ts"
+      "start": "bun run index.ts",
+      "build": "bun build index.ts --outdir ./dist --target node",
+      "test": "bun test",
+      "test:unit": "bun test tests/unit",
+      "test:integration": "bun test tests/integration"
     },
     "dependencies": {
       "@jxa/global-type": "^1.3.6",

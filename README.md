@@ -8,21 +8,22 @@ This is a Model Context Protocol (MCP) tool that allows Claude to interact with 
 
 ## Features
 
-- Mail:
-  - Read unread and regular emails
-  - Search emails by keywords
-  - Send emails with to, cc, and bcc recipients
-  - **Send HTML-formatted emails**
-  - **Attach files to emails**
-  - List mail folders
-- Calendar:
-  - View today's events
-  - View upcoming events
-  - Search for events
-  - Create new calendar events
-- Contacts:
-  - List contacts
-  - Search contacts by name
+- **Email Management**
+  - Read, search, and filter emails by date range
+  - Send emails with HTML support and attachments
+  - Reply, reply-all, and forward with comments
+  - Create drafts for manual editing
+  - Save attachments to disk
+- **Folder Management**
+  - Create, rename, and delete folders
+  - Move emails between folders
+  - Support for nested folder paths
+- **Calendar Operations**
+  - List, create, and delete events
+  - Respond to meeting invitations (accept/decline/tentative)
+  - Propose alternative meeting times
+- **Contacts**
+  - List and search contacts
 
 ## Prerequisites
 
@@ -76,6 +77,59 @@ Make sure to replace `YOURUSERNAME` with your actual macOS username and adjust t
    - Give Terminal (or your preferred terminal app) access to Accessibility features
    - You may see permission prompts when the tool is first used
 
+## Operations Reference
+
+### outlook_mail
+
+| Operation | Parameters | Description |
+|-----------|------------|-------------|
+| `read` | `folder`, `limit`, `startDate?`, `endDate?` | Read emails with optional date filtering |
+| `unread` | `folder`, `limit` | Get unread emails |
+| `search` | `searchTerm`, `folder`, `limit`, `startDate?`, `endDate?` | Search by content or subject |
+| `send` | `to`, `subject`, `body`, `cc?`, `bcc?`, `isHtml?`, `attachments?` | Send an email |
+| `reply` | `messageId`, `body`, `isHtml?` | Reply to an email |
+| `replyAll` | `messageId`, `body`, `isHtml?` | Reply-all to an email |
+| `forward` | `messageId`, `to`, `cc?`, `comment?`, `attachments?`, `includeOriginalAttachments?` | Forward an email |
+| `create_draft` | `to`, `subject`, `body`, `cc?`, `bcc?`, `isHtml?`, `attachments?` | Create draft (opens in Outlook) |
+| `move` | `messageId`, `targetFolder` | Move email to folder |
+| `count` | `folder` | Count emails in folder |
+| `save_attachments` | `messageId`, `destinationFolder` | Save attachments to disk |
+| `folders` | — | List all mail folders |
+| `create_folder` | `name`, `parent?` | Create a folder |
+| `rename_folder` | `path`, `newName` | Rename a folder |
+| `delete_folder` | `path` | Delete a folder |
+
+### outlook_calendar
+
+| Operation | Parameters | Description |
+|-----------|------------|-------------|
+| `list` | `startDate?`, `endDate?`, `limit?` | List calendar events |
+| `create` | `subject`, `startDate`, `startTime`, `endDate?`, `endTime?`, `location?`, `body?`, `attendees?`, `isAllDay?` | Create event |
+| `delete` | `eventId` | Delete event |
+| `accept` | `eventId`, `comment?` | Accept meeting invitation |
+| `decline` | `eventId`, `comment?` | Decline meeting invitation |
+| `tentative` | `eventId`, `comment?` | Tentatively accept meeting |
+| `propose_new_time` | `eventId`, `newStartDate`, `newStartTime`, `newEndDate?`, `newEndTime?`, `comment?` | Propose new meeting time |
+
+### outlook_contacts
+
+| Operation | Parameters | Description |
+|-----------|------------|-------------|
+| `list` | `limit?` | List contacts |
+| `search` | `query`, `limit?` | Search contacts by name |
+
+### Parameter Formats
+
+| Parameter | Format | Example |
+|-----------|--------|---------|
+| Date | `YYYY-MM-DD` | `2025-12-13` |
+| Time | `HH:MM` (24-hour) | `14:30` |
+| Folder path | Slash-separated | `Work/Projects/Active` |
+| Recipients | Comma-separated | `a@example.com, b@example.com` |
+| Attachments | Array of paths | `["/path/to/file.pdf"]` |
+
+> Parameters with `?` are optional.
+
 ## Usage
 
 Once installed, you can use the Outlook tool directly from Claude by asking questions like:
@@ -89,70 +143,60 @@ Once installed, you can use the Outlook tool directly from Claude by asking ques
 
 ## Examples
 
-### Email Operations
+### Natural Language (via Claude)
 
 ```
 Check my unread emails in Outlook
-```
-
-```
-Send an email to alex@example.com with subject "Project Update" and the following body: Here's the latest update on our project. We've completed phase 1 and are moving on to phase 2.
-```
-
-```
-Send an HTML email to team@example.com with subject "Weekly Report" and attach the quarterly_results.pdf file
-```
-
-```
 Search my emails for "budget meeting"
+Forward the last email from John to my team with a note "FYI"
+Move all emails from newsletters@example.com to my Archive folder
+What meetings do I have tomorrow?
 ```
 
-### Calendar Operations
+### JSON Examples (direct MCP calls)
 
-```
-What events do I have today?
-```
-
-```
-Create a calendar event for a team meeting tomorrow from 2pm to 3pm
-```
-
-```
-Show me my upcoming events for the next 2 weeks
-```
-
-### Contact Operations
-
-```
-List all my Outlook contacts
+**Read emails with date filter:**
+```json
+{
+  "operation": "read",
+  "folder": "Inbox",
+  "limit": 20,
+  "startDate": "2025-12-01",
+  "endDate": "2025-12-13"
+}
 ```
 
-```
-Search for contact information for Jane Smith
-```
-
-## Advanced Features
-
-### HTML Email Support
-
-You can send rich HTML-formatted emails by setting the `isHtml` parameter to true:
-
-```
-Send an HTML email to john@example.com with the subject "Project Update" and body "<h1>Project Update</h1><p>We've made <b>significant progress</b> on the project.</p>"
+**Forward with comment:**
+```json
+{
+  "operation": "forward",
+  "messageId": "12345",
+  "to": "colleague@example.com",
+  "comment": "FYI - see the discussion below"
+}
 ```
 
-### File Attachments
-
-You can attach files to your emails by providing the file paths in the `attachments` parameter:
-
+**Create a meeting:**
+```json
+{
+  "operation": "create",
+  "subject": "Weekly Sync",
+  "startDate": "2025-12-15",
+  "startTime": "10:00",
+  "endTime": "10:30",
+  "attendees": "team@example.com",
+  "location": "Conference Room A"
+}
 ```
-Send an email to jane@example.com with subject "Monthly Report" and attach the reports/march_2025.pdf file
-```
 
-For best results with attachments:
-- Use absolute file paths when possible
-- Make sure the files are accessible to the process running the MCP tool
-- Attachments will automatically be handled with robust error detection
+**Move email to nested folder:**
+```json
+{
+  "operation": "move",
+  "messageId": "12345",
+  "targetFolder": "Work/Projects/Active"
+}
+```
 
 ## Troubleshooting
 
