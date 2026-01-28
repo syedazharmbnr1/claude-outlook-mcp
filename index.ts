@@ -229,42 +229,85 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
   console.error(`[getUnreadEmails] Getting unread emails from folder: ${folder}, limit: ${limit}`);
   await checkOutlookAccess();
   
-  const folderPath = folder === "Inbox" ? "inbox" : folder;
   const script = `
     tell application "Microsoft Outlook"
       try
-        set theFolder to ${folderPath} -- Use the specified folder or default to inbox
-        set unreadMessages to {}
-        set allMessages to messages of theFolder
-        set i to 0
+        -- Get the folder by name safely (handle localization)
+        set targetFolder to null
+        set allFolders to mail folders
         
-        repeat with theMessage in allMessages
-          if read status of theMessage is false then
-            set i to i + 1
-            set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
-                       date:time sent of theMessage, id:id of theMessage}
-            
-            -- Try to get content
-            try
-              set msgContent to content of theMessage
-              if length of msgContent > 500 then
-                set msgContent to (text 1 thru 500 of msgContent) & "..."
-              end if
-              set msgData to msgData & {content:msgContent}
-            on error
-              set msgData to msgData & {content:"[Content not available]"}
-            end try
-            
-            set end of unreadMessages to msgData
-            
-            -- Stop if we've reached the limit
-            if i >= ${limit} then
-              exit repeat
-            end if
+        -- First try exact match
+        repeat with mailFolder in allFolders
+          if name of mailFolder is "${folder}" then
+            set targetFolder to mailFolder
+            exit repeat
           end if
         end repeat
         
-        return unreadMessages
+        -- If not found and looking for Inbox, try common localizations
+        if targetFolder is null and ("${folder}" is "Inbox" or "${folder}" is "inbox") then
+          repeat with mailFolder in allFolders
+            set folderName to name of mailFolder
+            if folderName is "Posteingang" or folderName is "Inbox" or folderName is "Boîte de réception" or folderName is "Bandeja de entrada" or folderName is "Posta in arrivo" or folderName is "Postvak IN" or folderName is "Caixa de Entrada" or folderName is "Indbakke" or folderName is "Innboks" or folderName is "Skrzynka odbiorcza" then
+              set targetFolder to mailFolder
+              exit repeat
+            end if
+          end repeat
+        end if
+        
+        -- Last resort: use AppleScript inbox keyword
+        if targetFolder is null then set targetFolder to inbox
+        
+        set outputText to ""
+        set allMessages to messages of targetFolder
+        set i to 0
+        
+        repeat with theMessage in allMessages
+          if i >= ${limit} then exit repeat
+          
+          if is read of theMessage is false then
+            try
+              set msgSubject to subject of theMessage
+              
+              -- Get sender info properly
+              set senderObj to sender of theMessage
+              try
+                set senderName to name of senderObj
+                set senderAddr to address of senderObj
+                set msgSender to senderName & " <" & senderAddr & ">"
+              on error
+                set msgSender to senderObj as string
+              end try
+              
+              set msgDate to time sent of theMessage as string
+              
+              -- Get content preview
+              set msgContent to ""
+              try
+                set msgContent to plain text content of theMessage
+                if length of msgContent > 300 then
+                  set msgContent to text 1 thru 300 of msgContent
+                end if
+              on error
+                try
+                  set msgContent to content of theMessage
+                  if length of msgContent > 300 then
+                    set msgContent to text 1 thru 300 of msgContent
+                  end if
+                on error
+                  set msgContent to "[Content not available]"
+                end try
+              end try
+              
+              set outputText to outputText & "<<<EMAIL>>>" & msgSubject & "<<<FIELD>>>" & msgSender & "<<<FIELD>>>" & msgDate & "<<<FIELD>>>" & msgContent
+              set i to i + 1
+            on error
+              -- Skip problematic messages
+            end try
+          end if
+        end repeat
+        
+        return outputText
       on error errMsg
         return "Error: " & errMsg
       end try
@@ -275,45 +318,25 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
     const result = await runAppleScript(script);
     console.error(`[getUnreadEmails] Raw result length: ${result.length}`);
     
-    // Parse the results (AppleScript returns records as text)
     if (result.startsWith("Error:")) {
       throw new Error(result);
     }
     
-    // Simple parsing for demonstration
-    // In a production environment, you'd want more robust parsing
-    const emails = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const email: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              email[key] = value;
-            }
-          });
-          
-          if (email.subject || email.sender) {
-            emails.push({
-              subject: email.subject || "No subject",
-              sender: email.sender || "Unknown sender",
-              dateSent: email.date || new Date().toString(),
-              content: email.content || "[Content not available]",
-              id: email.id || ""
-            });
-          }
-        } catch (parseError) {
-          console.error('[getUnreadEmails] Error parsing email match:', parseError);
-        }
-      }
+    if (!result || result.trim() === "") {
+      return [];
     }
+    
+    // Parse using our custom delimiters
+    const emailStrings = result.split("<<<EMAIL>>>").filter(s => s.trim() !== "");
+    const emails = emailStrings.map(emailStr => {
+      const parts = emailStr.split("<<<FIELD>>>");
+      return {
+        subject: parts[0] || "No subject",
+        sender: parts[1] || "Unknown sender",
+        dateSent: parts[2] || new Date().toString(),
+        content: parts[3] || "[Content not available]"
+      };
+    });
     
     console.error(`[getUnreadEmails] Found ${emails.length} unread emails`);
     return emails;
@@ -328,43 +351,83 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
   console.error(`[searchEmails] Searching for "${searchTerm}" in folder: ${folder}, limit: ${limit}`);
   await checkOutlookAccess();
   
-  const folderPath = folder === "Inbox" ? "inbox" : folder;
   const script = `
     tell application "Microsoft Outlook"
       try
-        set theFolder to ${folderPath}
-        set searchResults to {}
-        set allMessages to messages of theFolder
+        -- Get the folder by name safely (handle localization)
+        set targetFolder to null
+        set allFolders to mail folders
+        
+        -- First try exact match
+        repeat with mailFolder in allFolders
+          if name of mailFolder is "${folder}" then
+            set targetFolder to mailFolder
+            exit repeat
+          end if
+        end repeat
+        
+        -- If not found and looking for Inbox, try common localizations
+        if targetFolder is null and ("${folder}" is "Inbox" or "${folder}" is "inbox") then
+          repeat with mailFolder in allFolders
+            set folderName to name of mailFolder
+            if folderName is "Posteingang" or folderName is "Inbox" or folderName is "Boîte de réception" or folderName is "Bandeja de entrada" or folderName is "Posta in arrivo" or folderName is "Postvak IN" or folderName is "Caixa de Entrada" or folderName is "Indbakke" or folderName is "Innboks" or folderName is "Skrzynka odbiorcza" then
+              set targetFolder to mailFolder
+              exit repeat
+            end if
+          end repeat
+        end if
+        
+        -- Last resort: use AppleScript inbox keyword
+        if targetFolder is null then set targetFolder to inbox
+        
+        set outputText to ""
+        set allMessages to messages of targetFolder
         set i to 0
         set searchString to "${searchTerm.replace(/"/g, '\\"')}"
         
         repeat with theMessage in allMessages
-          if (subject of theMessage contains searchString) or (content of theMessage contains searchString) then
-            set i to i + 1
-            set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
-                       date:time sent of theMessage, id:id of theMessage}
-            
-            -- Try to get content
+          if i >= ${limit} then exit repeat
+          
+          try
+            set msgSubject to subject of theMessage
+            set msgContentRaw to ""
             try
-              set msgContent to content of theMessage
-              if length of msgContent > 500 then
-                set msgContent to (text 1 thru 500 of msgContent) & "..."
-              end if
-              set msgData to msgData & {content:msgContent}
+              set msgContentRaw to plain text content of theMessage
             on error
-              set msgData to msgData & {content:"[Content not available]"}
+              try
+                set msgContentRaw to content of theMessage
+              end try
             end try
             
-            set end of searchResults to msgData
-            
-            -- Stop if we've reached the limit
-            if i >= ${limit} then
-              exit repeat
+            if (msgSubject contains searchString) or (msgContentRaw contains searchString) then
+              -- Get sender info properly
+              set senderObj to sender of theMessage
+              try
+                set senderName to name of senderObj
+                set senderAddr to address of senderObj
+                set msgSender to senderName & " <" & senderAddr & ">"
+              on error
+                set msgSender to senderObj as string
+              end try
+              
+              set msgDate to time sent of theMessage as string
+              
+              -- Get content preview
+              set msgContent to msgContentRaw
+              if length of msgContent > 300 then
+                set msgContent to text 1 thru 300 of msgContent
+              end if
+              if msgContent is "" then set msgContent to "[Content not available]"
+              
+              set outputText to outputText & "<<<EMAIL>>>" & msgSubject & "<<<FIELD>>>" & msgSender & "<<<FIELD>>>" & msgDate & "<<<FIELD>>>" & msgContent
+              set i to i + 1
             end if
-          end if
+          on error
+            -- Skip problematic messages
+          end try
         end repeat
         
-        return searchResults
+        return outputText
       on error errMsg
         return "Error: " & errMsg
       end try
@@ -375,44 +438,25 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
     const result = await runAppleScript(script);
     console.error(`[searchEmails] Raw result length: ${result.length}`);
     
-    // Parse the results
     if (result.startsWith("Error:")) {
       throw new Error(result);
     }
     
-    // Parse the emails similar to unread emails
-    const emails = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const email: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              email[key] = value;
-            }
-          });
-          
-          if (email.subject || email.sender) {
-            emails.push({
-              subject: email.subject || "No subject",
-              sender: email.sender || "Unknown sender",
-              dateSent: email.date || new Date().toString(),
-              content: email.content || "[Content not available]",
-              id: email.id || ""
-            });
-          }
-        } catch (parseError) {
-          console.error('[searchEmails] Error parsing email match:', parseError);
-        }
-      }
+    if (!result || result.trim() === "") {
+      return [];
     }
+    
+    // Parse using our custom delimiters
+    const emailStrings = result.split("<<<EMAIL>>>").filter(s => s.trim() !== "");
+    const emails = emailStrings.map(emailStr => {
+      const parts = emailStr.split("<<<FIELD>>>");
+      return {
+        subject: parts[0] || "No subject",
+        sender: parts[1] || "Unknown sender",
+        dateSent: parts[2] || new Date().toString(),
+        content: parts[3] || "[Content not available]"
+      };
+    });
     
     console.error(`[searchEmails] Found ${emails.length} matching emails`);
     return emails;
@@ -765,13 +809,14 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
     console.error(`[readEmails] Reading emails from folder: ${folder}, limit: ${limit}`);
     await checkOutlookAccess();
     
-    // Use a simplified approach that should be more compatible
     const script = `
       tell application "Microsoft Outlook"
         try
-          -- Get the folder by name safely
+          -- Get the folder by name safely (handle localization)
           set targetFolder to null
           set allFolders to mail folders
+          
+          -- First try exact match
           repeat with mailFolder in allFolders
             if name of mailFolder is "${folder}" then
               set targetFolder to mailFolder
@@ -779,10 +824,22 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
             end if
           end repeat
           
+          -- If not found and looking for Inbox, try common localizations
+          if targetFolder is null and ("${folder}" is "Inbox" or "${folder}" is "inbox") then
+            repeat with mailFolder in allFolders
+              set folderName to name of mailFolder
+              if folderName is "Posteingang" or folderName is "Inbox" or folderName is "Boîte de réception" or folderName is "Bandeja de entrada" or folderName is "Posta in arrivo" or folderName is "Postvak IN" or folderName is "Caixa de Entrada" or folderName is "Indbakke" or folderName is "Innboks" or folderName is "Skrzynka odbiorcza" then
+                set targetFolder to mailFolder
+                exit repeat
+              end if
+            end repeat
+          end if
+          
+          -- Last resort: use AppleScript inbox keyword
           if targetFolder is null then set targetFolder to inbox
           
           -- Get messages
-          set messageList to {}
+          set outputText to ""
           set msgCount to 0
           set allMsgs to messages of targetFolder
           
@@ -792,19 +849,46 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
             try
               set theMsg to item i of allMsgs
               set msgSubject to subject of theMsg
-              set msgSender to sender of theMsg
-              set msgDate to time sent of theMsg
               
-              -- Create a simple text representation for the message
-              set msgInfo to msgSubject & " | " & msgSender & " | " & msgDate
-              set end of messageList to msgInfo
+              -- Get sender info properly
+              set senderObj to sender of theMsg
+              try
+                set senderName to name of senderObj
+                set senderAddr to address of senderObj
+                set msgSender to senderName & " <" & senderAddr & ">"
+              on error
+                set msgSender to senderObj as string
+              end try
+              
+              set msgDate to time sent of theMsg as string
+              
+              -- Get content preview
+              set msgContent to ""
+              try
+                set msgContent to plain text content of theMsg
+                if length of msgContent > 300 then
+                  set msgContent to text 1 thru 300 of msgContent
+                end if
+              on error
+                try
+                  set msgContent to content of theMsg
+                  if length of msgContent > 300 then
+                    set msgContent to text 1 thru 300 of msgContent
+                  end if
+                on error
+                  set msgContent to "[Content not available]"
+                end try
+              end try
+              
+              -- Use a unique delimiter that won't appear in email content
+              set outputText to outputText & "<<<EMAIL>>>" & msgSubject & "<<<FIELD>>>" & msgSender & "<<<FIELD>>>" & msgDate & "<<<FIELD>>>" & msgContent
               set msgCount to msgCount + 1
-            on error
+            on error errMsg
               -- Skip problematic messages
             end try
           end repeat
           
-          return messageList
+          return outputText
         on error errMsg
           return "Error: " & errMsg
         end try
@@ -818,18 +902,23 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
         throw new Error(result);
       }
       
-      // Parse the results in a simple format
-      const emails = result.split(", ").map(msgInfo => {
-        const parts = msgInfo.split(" | ");
+      if (!result || result.trim() === "") {
+        return [];
+      }
+      
+      // Parse using our custom delimiters
+      const emailStrings = result.split("<<<EMAIL>>>").filter(s => s.trim() !== "");
+      const emails = emailStrings.map(emailStr => {
+        const parts = emailStr.split("<<<FIELD>>>");
         return {
           subject: parts[0] || "No subject",
           sender: parts[1] || "Unknown sender",
           dateSent: parts[2] || new Date().toString(),
-          content: "Content not retrieved in simple mode"
+          content: parts[3] || "[Content not available]"
         };
       });
       
-      console.error(`[readEmails] Found ${emails.length} emails using simplified approach`);
+      console.error(`[readEmails] Found ${emails.length} emails`);
       return emails;
     } catch (error) {
       console.error("[readEmails] Error reading emails:", error);
@@ -865,11 +954,12 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
       
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
-        set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
-                     location:location of theEvent, ¬
-                     id:id of theEvent}
+        set eventSubject to subject of theEvent
+        set eventStart to start time of theEvent
+        set eventEnd to end time of theEvent
+        set eventLocation to location of theEvent
+        set eventId to id of theEvent
+        set eventData to {subject:eventSubject, startTime:eventStart, endTime:eventEnd, location:eventLocation, eventId:eventId}
         
         set end of todayEvents to eventData
       end repeat
@@ -904,10 +994,10 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
           if (event.subject) {
             events.push({
               subject: event.subject,
-              start: event.start,
-              end: event.end,
+              start: event.startTime || event.start,
+              end: event.endTime || event.end,
               location: event.location || "No location",
-              id: event.id
+              id: event.eventId || event.id
             });
           }
         } catch (parseError) {
@@ -948,11 +1038,12 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
       
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
-        set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
-                     location:location of theEvent, ¬
-                     id:id of theEvent}
+        set eventSubject to subject of theEvent
+        set eventStart to start time of theEvent
+        set eventEnd to end time of theEvent
+        set eventLocation to location of theEvent
+        set eventId to id of theEvent
+        set eventData to {subject:eventSubject, startTime:eventStart, endTime:eventEnd, location:eventLocation, eventId:eventId}
         
         set end of upcomingEvents to eventData
       end repeat
@@ -987,10 +1078,10 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
           if (event.subject) {
             events.push({
               subject: event.subject,
-              start: event.start,
-              end: event.end,
+              start: event.startTime || event.start,
+              end: event.endTime || event.end,
               location: event.location || "No location",
-              id: event.id
+              id: event.eventId || event.id
             });
           }
         } catch (parseError) {
@@ -1023,11 +1114,12 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
       repeat with theEvent in allEvents
         if (subject of theEvent contains searchString) or (location of theEvent contains searchString) then
           set i to i + 1
-          set eventData to {subject:subject of theEvent, ¬
-                       start:start time of theEvent, ¬
-                       end:end time of theEvent, ¬
-                       location:location of theEvent, ¬
-                       id:id of theEvent}
+          set eventSubject to subject of theEvent
+          set eventStart to start time of theEvent
+          set eventEnd to end time of theEvent
+          set eventLocation to location of theEvent
+          set eventId to id of theEvent
+          set eventData to {subject:eventSubject, startTime:eventStart, endTime:eventEnd, location:eventLocation, eventId:eventId}
           
           set end of searchResults to eventData
           
@@ -1068,10 +1160,10 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
           if (event.subject) {
             events.push({
               subject: event.subject,
-              start: event.start,
-              end: event.end,
+              start: event.startTime || event.start,
+              end: event.endTime || event.end,
               location: event.location || "No location",
-              id: event.id
+              id: event.eventId || event.id
             });
           }
         } catch (parseError) {
