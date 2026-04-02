@@ -6,7 +6,116 @@ import {
   ListToolsRequestSchema,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { runAppleScript } from 'run-applescript';
+import { runAppleScript } from "run-applescript";
+import { readFileSync, realpathSync, constants as fsConstants } from "node:fs";
+import { access, stat } from "node:fs/promises";
+import { resolve, dirname } from "node:path";
+import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+
+// ====================================================
+// 0. Security Helpers & Configuration
+// ====================================================
+
+/**
+ * Escape a string for safe interpolation into an AppleScript string literal.
+ * Escapes backslashes first (so they don't re-escape quotes), then double quotes.
+ */
+function escapeForAppleScript(str: string): string {
+  return str.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/** Resolve ~ to the actual home directory */
+function expandTilde(p: string): string {
+  if (p.startsWith("~/") || p === "~") {
+    return p.replace("~", homedir());
+  }
+  return p;
+}
+
+/**
+ * Load attachment allowlist from config.json.
+ * Falls back to sensible defaults if the config file is missing or malformed.
+ */
+let _cachedAllowlist: string[] | null = null;
+
+function loadAttachmentAllowlist(): string[] {
+  if (_cachedAllowlist) return _cachedAllowlist;
+
+  const defaults = ["~/Downloads", "~/Documents", "~/Desktop"];
+  try {
+    const configPath = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      "config.json",
+    );
+    const raw = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(raw);
+    const dirs = config?.attachments?.allowedDirectories;
+    if (Array.isArray(dirs) && dirs.length > 0) {
+      _cachedAllowlist = dirs;
+      return dirs;
+    }
+    console.error(
+      "[config] No allowedDirectories in config.json, using defaults",
+    );
+    _cachedAllowlist = defaults;
+    return defaults;
+  } catch (err) {
+    console.error(
+      "[config] Could not load config.json, using defaults:",
+      (err as Error).message,
+    );
+    _cachedAllowlist = defaults;
+    return defaults;
+  }
+}
+
+/**
+ * Validate that a file path is within the attachment allowlist.
+ * Resolves symlinks and relative segments before checking.
+ * Throws with a descriptive message if the path is outside all allowed directories.
+ */
+function validateAttachmentPath(filePath: string): string {
+  let absolutePath = filePath;
+  if (!filePath.startsWith("/")) {
+    absolutePath = resolve(process.cwd(), filePath);
+  }
+
+  let canonicalPath: string;
+  try {
+    canonicalPath = realpathSync(absolutePath);
+  } catch {
+    canonicalPath = resolve(absolutePath);
+  }
+
+  const allowedDirs = loadAttachmentAllowlist();
+  const expandedAllowed = allowedDirs.map((d) => expandTilde(d));
+
+  for (const allowedDir of expandedAllowed) {
+    let canonicalAllowed: string;
+    try {
+      canonicalAllowed = realpathSync(allowedDir);
+    } catch {
+      canonicalAllowed = resolve(allowedDir);
+    }
+    const prefix = canonicalAllowed.endsWith("/")
+      ? canonicalAllowed
+      : canonicalAllowed + "/";
+    if (
+      canonicalPath === canonicalAllowed ||
+      canonicalPath.startsWith(prefix)
+    ) {
+      return canonicalPath;
+    }
+  }
+
+  const displayAllowed = allowedDirs.join(", ");
+  throw new Error(
+    `SECURITY: Attachment path "${filePath}" (resolved to "${canonicalPath}") is outside allowed directories [${displayAllowed}]. ` +
+      `To allow this path, add its parent directory to the "attachments.allowedDirectories" array in config.json ` +
+      `(located at ${resolve(dirname(fileURLToPath(import.meta.url)), "config.json")}).`,
+  );
+}
 
 // ====================================================
 // 1. Tool Definitions
@@ -15,114 +124,127 @@ import { runAppleScript } from 'run-applescript';
 // Define Outlook Mail tool
 const OUTLOOK_MAIL_TOOL: Tool = {
   name: "outlook_mail",
-  description: "Interact with Microsoft Outlook for macOS - read, search, send, and manage emails",
+  description:
+    "Interact with Microsoft Outlook for macOS - read, search, send, and manage emails",
   inputSchema: {
     type: "object",
     properties: {
       operation: {
         type: "string",
-        description: "Operation to perform: 'unread', 'search', 'send', 'folders', or 'read'",
-        enum: ["unread", "search", "send", "folders", "read"]
+        description:
+          "Operation to perform: 'unread', 'search', 'send', 'folders', or 'read'",
+        enum: ["unread", "search", "send", "folders", "read"],
       },
       folder: {
         type: "string",
-        description: "Email folder to use (optional - if not provided, uses inbox or searches across all folders)"
+        description:
+          "Email folder to use (optional - if not provided, uses inbox or searches across all folders)",
       },
       limit: {
         type: "number",
-        description: "Number of emails to retrieve (optional, for unread, read, and search operations)"
+        description:
+          "Number of emails to retrieve (optional, for unread, read, and search operations)",
       },
       searchTerm: {
         type: "string",
-        description: "Text to search for in emails (required for search operation)"
+        description:
+          "Text to search for in emails (required for search operation)",
       },
       to: {
         type: "string",
-        description: "Recipient email address (required for send operation)"
+        description: "Recipient email address (required for send operation)",
       },
       subject: {
         type: "string",
-        description: "Email subject (required for send operation)"
+        description: "Email subject (required for send operation)",
       },
       body: {
         type: "string",
-        description: "Email body content (required for send operation)"
+        description: "Email body content (required for send operation)",
       },
       isHtml: {
         type: "boolean",
-        description: "Whether the body content is HTML (optional for send operation, default: false)"
+        description:
+          "Whether the body content is HTML (optional for send operation, default: false)",
       },
       cc: {
         type: "string",
-        description: "CC email address (optional for send operation)"
+        description: "CC email address (optional for send operation)",
       },
       bcc: {
         type: "string",
-        description: "BCC email address (optional for send operation)"
+        description: "BCC email address (optional for send operation)",
       },
       attachments: {
         type: "array",
-        description: "File paths to attach to the email (optional for send operation)",
+        description:
+          "File paths to attach to the email (optional for send operation)",
         items: {
-          type: "string"
-        }
-      }
+          type: "string",
+        },
+      },
     },
-    required: ["operation"]
-  }
+    required: ["operation"],
+  },
 };
 
 // Define Outlook Calendar tool
 const OUTLOOK_CALENDAR_TOOL: Tool = {
   name: "outlook_calendar",
-  description: "Interact with Microsoft Outlook for macOS calendar - view, create, and manage events",
+  description:
+    "Interact with Microsoft Outlook for macOS calendar - view, create, and manage events",
   inputSchema: {
     type: "object",
     properties: {
       operation: {
         type: "string",
-        description: "Operation to perform: 'today', 'upcoming', 'search', or 'create'",
-        enum: ["today", "upcoming", "search", "create"]
+        description:
+          "Operation to perform: 'today', 'upcoming', 'search', or 'create'",
+        enum: ["today", "upcoming", "search", "create"],
       },
       searchTerm: {
         type: "string",
-        description: "Text to search for in events (required for search operation)"
+        description:
+          "Text to search for in events (required for search operation)",
       },
       limit: {
         type: "number",
-        description: "Number of events to retrieve (optional, for today and upcoming operations)"
+        description:
+          "Number of events to retrieve (optional, for today and upcoming operations)",
       },
       days: {
         type: "number",
-        description: "Number of days to look ahead (optional, for upcoming operation, default: 7)"
+        description:
+          "Number of days to look ahead (optional, for upcoming operation, default: 7)",
       },
       subject: {
         type: "string",
-        description: "Event subject/title (required for create operation)"
+        description: "Event subject/title (required for create operation)",
       },
       start: {
         type: "string",
-        description: "Start time in ISO format (required for create operation)"
+        description: "Start time in ISO format (required for create operation)",
       },
       end: {
         type: "string",
-        description: "End time in ISO format (required for create operation)"
+        description: "End time in ISO format (required for create operation)",
       },
       location: {
         type: "string",
-        description: "Event location (optional for create operation)"
+        description: "Event location (optional for create operation)",
       },
       body: {
         type: "string",
-        description: "Event description/body (optional for create operation)"
+        description: "Event description/body (optional for create operation)",
       },
       attendees: {
         type: "string",
-        description: "Comma-separated list of attendee email addresses (optional for create operation)"
-      }
+        description:
+          "Comma-separated list of attendee email addresses (optional for create operation)",
+      },
     },
-    required: ["operation"]
-  }
+    required: ["operation"],
+  },
 };
 
 // Define Outlook Contacts tool
@@ -135,19 +257,20 @@ const OUTLOOK_CONTACTS_TOOL: Tool = {
       operation: {
         type: "string",
         description: "Operation to perform: 'list' or 'search'",
-        enum: ["list", "search"]
+        enum: ["list", "search"],
       },
       searchTerm: {
         type: "string",
-        description: "Text to search for in contacts (required for search operation)"
+        description:
+          "Text to search for in contacts (required for search operation)",
       },
       limit: {
         type: "number",
-        description: "Number of contacts to retrieve (optional)"
-      }
+        description: "Number of contacts to retrieve (optional)",
+      },
     },
-    required: ["operation"]
-  }
+    required: ["operation"],
+  },
 };
 
 // ====================================================
@@ -165,7 +288,7 @@ const server = new Server(
     capabilities: {
       tools: {},
     },
-  }
+  },
 );
 
 // ====================================================
@@ -184,10 +307,14 @@ async function checkOutlookAccess(): Promise<boolean> {
     `);
 
     if (isInstalled !== "true") {
-      console.error("[checkOutlookAccess] Microsoft Outlook is not installed or running");
-      throw new Error("Microsoft Outlook is not installed or running on this system");
+      console.error(
+        "[checkOutlookAccess] Microsoft Outlook is not installed or running",
+      );
+      throw new Error(
+        "Microsoft Outlook is not installed or running on this system",
+      );
     }
-    
+
     const isRunning = await runAppleScript(`
       tell application "System Events"
         set outlookRunning to application process "Microsoft Outlook" exists
@@ -196,7 +323,9 @@ async function checkOutlookAccess(): Promise<boolean> {
     `);
 
     if (isRunning !== "true") {
-      console.error("[checkOutlookAccess] Microsoft Outlook is not running, attempting to launch...");
+      console.error(
+        "[checkOutlookAccess] Microsoft Outlook is not running, attempting to launch...",
+      );
       try {
         await runAppleScript(`
           tell application "Microsoft Outlook" to activate
@@ -204,18 +333,25 @@ async function checkOutlookAccess(): Promise<boolean> {
         `);
         console.error("[checkOutlookAccess] Launched Outlook successfully");
       } catch (activateError) {
-        console.error("[checkOutlookAccess] Error activating Microsoft Outlook:", activateError);
-        throw new Error("Could not activate Microsoft Outlook. Please start it manually.");
+        console.error(
+          "[checkOutlookAccess] Error activating Microsoft Outlook:",
+          activateError,
+        );
+        throw new Error(
+          "Could not activate Microsoft Outlook. Please start it manually.",
+        );
       }
     } else {
-      console.error("[checkOutlookAccess] Microsoft Outlook is already running");
+      console.error(
+        "[checkOutlookAccess] Microsoft Outlook is already running",
+      );
     }
-    
+
     return true;
   } catch (error) {
     console.error("[checkOutlookAccess] Outlook access check failed:", error);
     throw new Error(
-      `Cannot access Microsoft Outlook. Please make sure Outlook is installed and properly configured. Error: ${error instanceof Error ? error.message : String(error)}`
+      `Cannot access Microsoft Outlook. Please make sure Outlook is installed and properly configured. Error: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
@@ -225,10 +361,15 @@ async function checkOutlookAccess(): Promise<boolean> {
 // ====================================================
 
 // Function to get unread emails
-async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Promise<any[]> {
-  console.error(`[getUnreadEmails] Getting unread emails from folder: ${folder}, limit: ${limit}`);
+async function getUnreadEmails(
+  folder: string = "Inbox",
+  limit: number = 10,
+): Promise<any[]> {
+  console.error(
+    `[getUnreadEmails] Getting unread emails from folder: ${folder}, limit: ${limit}`,
+  );
   await checkOutlookAccess();
-  
+
   const folderPath = folder === "Inbox" ? "inbox" : folder;
   const script = `
     tell application "Microsoft Outlook"
@@ -237,13 +378,13 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
         set unreadMessages to {}
         set allMessages to messages of theFolder
         set i to 0
-        
+
         repeat with theMessage in allMessages
           if read status of theMessage is false then
             set i to i + 1
             set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
                        date:time sent of theMessage, id:id of theMessage}
-            
+
             -- Try to get content
             try
               set msgContent to content of theMessage
@@ -254,67 +395,70 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
             on error
               set msgData to msgData & {content:"[Content not available]"}
             end try
-            
+
             set end of unreadMessages to msgData
-            
+
             -- Stop if we've reached the limit
             if i >= ${limit} then
               exit repeat
             end if
           end if
         end repeat
-        
+
         return unreadMessages
       on error errMsg
         return "Error: " & errMsg
       end try
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[getUnreadEmails] Raw result length: ${result.length}`);
-    
+
     // Parse the results (AppleScript returns records as text)
     if (result.startsWith("Error:")) {
       throw new Error(result);
     }
-    
+
     // Simple parsing for demonstration
     // In a production environment, you'd want more robust parsing
     const emails = [];
     const matches = result.match(/\{([^}]+)\}/g);
-    
+
     if (matches && matches.length > 0) {
       for (const match of matches) {
         try {
-          const props = match.substring(1, match.length - 1).split(',');
+          const props = match.substring(1, match.length - 1).split(",");
           const email: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
+
+          props.forEach((prop) => {
+            const parts = prop.split(":");
             if (parts.length >= 2) {
               const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
+              const value = parts.slice(1).join(":").trim();
               email[key] = value;
             }
           });
-          
+
           if (email.subject || email.sender) {
             emails.push({
               subject: email.subject || "No subject",
               sender: email.sender || "Unknown sender",
               dateSent: email.date || new Date().toString(),
               content: email.content || "[Content not available]",
-              id: email.id || ""
+              id: email.id || "",
             });
           }
         } catch (parseError) {
-          console.error('[getUnreadEmails] Error parsing email match:', parseError);
+          console.error(
+            "[getUnreadEmails] Error parsing email match:",
+            parseError,
+          );
         }
       }
     }
-    
+
     console.error(`[getUnreadEmails] Found ${emails.length} unread emails`);
     return emails;
   } catch (error) {
@@ -324,10 +468,16 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
 }
 
 // Function to search emails
-async function searchEmails(searchTerm: string, folder: string = "Inbox", limit: number = 10): Promise<any[]> {
-  console.error(`[searchEmails] Searching for "${searchTerm}" in folder: ${folder}, limit: ${limit}`);
+async function searchEmails(
+  searchTerm: string,
+  folder: string = "Inbox",
+  limit: number = 10,
+): Promise<any[]> {
+  console.error(
+    `[searchEmails] Searching for "${searchTerm}" in folder: ${folder}, limit: ${limit}`,
+  );
   await checkOutlookAccess();
-  
+
   const folderPath = folder === "Inbox" ? "inbox" : folder;
   const script = `
     tell application "Microsoft Outlook"
@@ -336,14 +486,14 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
         set searchResults to {}
         set allMessages to messages of theFolder
         set i to 0
-        set searchString to "${searchTerm.replace(/"/g, '\\"')}"
-        
+        set searchString to "${escapeForAppleScript(searchTerm)}"
+
         repeat with theMessage in allMessages
           if (subject of theMessage contains searchString) or (content of theMessage contains searchString) then
             set i to i + 1
             set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
                        date:time sent of theMessage, id:id of theMessage}
-            
+
             -- Try to get content
             try
               set msgContent to content of theMessage
@@ -354,66 +504,69 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
             on error
               set msgData to msgData & {content:"[Content not available]"}
             end try
-            
+
             set end of searchResults to msgData
-            
+
             -- Stop if we've reached the limit
             if i >= ${limit} then
               exit repeat
             end if
           end if
         end repeat
-        
+
         return searchResults
       on error errMsg
         return "Error: " & errMsg
       end try
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[searchEmails] Raw result length: ${result.length}`);
-    
+
     // Parse the results
     if (result.startsWith("Error:")) {
       throw new Error(result);
     }
-    
+
     // Parse the emails similar to unread emails
     const emails = [];
     const matches = result.match(/\{([^}]+)\}/g);
-    
+
     if (matches && matches.length > 0) {
       for (const match of matches) {
         try {
-          const props = match.substring(1, match.length - 1).split(',');
+          const props = match.substring(1, match.length - 1).split(",");
           const email: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
+
+          props.forEach((prop) => {
+            const parts = prop.split(":");
             if (parts.length >= 2) {
               const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
+              const value = parts.slice(1).join(":").trim();
               email[key] = value;
             }
           });
-          
+
           if (email.subject || email.sender) {
             emails.push({
               subject: email.subject || "No subject",
               sender: email.sender || "Unknown sender",
               dateSent: email.date || new Date().toString(),
               content: email.content || "[Content not available]",
-              id: email.id || ""
+              id: email.id || "",
             });
           }
         } catch (parseError) {
-          console.error('[searchEmails] Error parsing email match:', parseError);
+          console.error(
+            "[searchEmails] Error parsing email match:",
+            parseError,
+          );
         }
       }
     }
-    
+
     console.error(`[searchEmails] Found ${emails.length} matching emails`);
     return emails;
   } catch (error) {
@@ -426,21 +579,17 @@ async function checkAttachmentPath(filePath: string): Promise<string> {
   try {
     // Convert to absolute path if relative
     let fullPath = filePath;
-    if (!filePath.startsWith('/')) {
+    if (!filePath.startsWith("/")) {
       const cwd = process.cwd();
       fullPath = `${cwd}/${filePath}`;
     }
-    
+    fullPath = validateAttachmentPath(fullPath);
+
     // Check if the file exists and is readable
-    const fs = require('fs');
-    const { promisify } = require('util');
-    const access = promisify(fs.access);
-    const stat = promisify(fs.stat);
-    
     try {
-      await access(fullPath, fs.constants.R_OK);
+      await access(fullPath, fsConstants.R_OK);
       const stats = await stat(fullPath);
-      
+
       return `File exists and is readable: ${fullPath}\nSize: ${stats.size} bytes\nPermissions: ${stats.mode.toString(8)}\nLast modified: ${stats.mtime}`;
     } catch (err) {
       return `ERROR: Cannot access file: ${fullPath}\nError details: ${err.message}`;
@@ -455,15 +604,15 @@ async function debugSendEmailWithAttachment(
   to: string,
   subject: string,
   body: string,
-  attachmentPath: string
+  attachmentPath: string,
 ): Promise<string> {
   // First check if the file exists and is readable
   const fileStatus = await checkAttachmentPath(attachmentPath);
   console.error(`[debugSendEmail] Attachment status: ${fileStatus}`);
-  
+
   // Create a simple AppleScript that just attempts to open the file
   const script = `
-    set theFile to POSIX file "${attachmentPath.replace(/"/g, '\\"')}"
+    set theFile to POSIX file "${escapeForAppleScript(attachmentPath)}"
     try
       tell application "Finder"
         set fileExists to exists file theFile
@@ -474,37 +623,37 @@ async function debugSendEmailWithAttachment(
       return "Error accessing file: " & errMsg
     end try
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[debugSendEmail] AppleScript file check: ${result}`);
-    
+
     // Now try to actually create a draft with the attachment
     const emailScript = `
       tell application "Microsoft Outlook"
         try
-          set newMessage to make new outgoing message with properties {subject:"DEBUG: ${subject.replace(/"/g, '\\"')}", visible:true}
-          set content of newMessage to "${body.replace(/"/g, '\\"')}"
-          set to recipients of newMessage to {"${to}"}
-          
+          set newMessage to make new outgoing message with properties {subject:"DEBUG: ${escapeForAppleScript(subject)}", visible:true}
+          set content of newMessage to "${escapeForAppleScript(body)}"
+          set to recipients of newMessage to {"${escapeForAppleScript(to)}"}
+
           try
-            set attachmentFile to POSIX file "${attachmentPath.replace(/"/g, '\\"')}"
+            set attachmentFile to POSIX file "${escapeForAppleScript(attachmentPath)}"
             make new attachment at newMessage with properties {file:attachmentFile}
             set attachResult to "Successfully attached file"
           on error attachErrMsg
             set attachResult to "Failed to attach file: " & attachErrMsg
           end try
-          
+
           return attachResult
         on error errMsg
           return "Error creating email: " & errMsg
         end try
       end tell
     `;
-    
+
     const attachResult = await runAppleScript(emailScript);
     console.error(`[debugSendEmail] Attachment result: ${attachResult}`);
-    
+
     return `File check: ${fileStatus}\n\nAttachment test: ${attachResult}`;
   } catch (error) {
     console.error("[debugSendEmail] Error during debug:", error);
@@ -513,26 +662,28 @@ async function debugSendEmailWithAttachment(
 }
 // Update the sendEmail function to handle attachments and HTML content
 async function sendEmail(
-  to: string, 
-  subject: string, 
-  body: string, 
-  cc?: string, 
-  bcc?: string, 
+  to: string,
+  subject: string,
+  body: string,
+  cc?: string,
+  bcc?: string,
   isHtml: boolean = false,
-  attachments?: string[]
+  attachments?: string[],
 ): Promise<string> {
   console.error(`[sendEmail] Sending email to: ${to}, subject: "${subject}"`);
-  console.error(`[sendEmail] Attachments: ${attachments ? JSON.stringify(attachments) : 'none'}`);
-  
+  console.error(
+    `[sendEmail] Attachments: ${attachments ? JSON.stringify(attachments) : "none"}`,
+  );
+
   await checkOutlookAccess();
 
   // Extract name from email if possible (for display name)
   const extractNameFromEmail = (email: string): string => {
-    const namePart = email.split('@')[0];
+    const namePart = email.split("@")[0];
     return namePart
-      .split('.')
-      .map(part => part.charAt(0).toUpperCase() + part.slice(1))
-      .join(' ');
+      .split(".")
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" ");
   };
 
   // Get name for display
@@ -541,29 +692,28 @@ async function sendEmail(
   const bccName = bcc ? extractNameFromEmail(bcc) : "";
 
   // Escape special characters
-  const escapedSubject = subject.replace(/"/g, '\\"');
-  const escapedBody = body.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-  
+  const escapedSubject = escapeForAppleScript(subject);
+  const escapedBody = escapeForAppleScript(body).replace(/\n/g, "\\n");
+
   // Process attachments: Convert to absolute paths if they are relative
   let processedAttachments: string[] = [];
   if (attachments && attachments.length > 0) {
-    processedAttachments = attachments.map(path => {
-      // Check if path is absolute (starts with /)
-      if (path.startsWith('/')) {
-        return path;
-      }
-      // Get current working directory and join with relative path
-      const cwd = process.cwd();
-      return `${cwd}/${path}`;
-    });
-    console.error(`[sendEmail] Processed attachments: ${JSON.stringify(processedAttachments)}`);
+    for (const attachPath of attachments) {
+      const validated = validateAttachmentPath(attachPath);
+      processedAttachments.push(validated);
+    }
+    console.error(
+      `[sendEmail] Validated attachments: ${processedAttachments.length} file(s) passed allowlist check`,
+    );
   }
-  
+
   // Create attachment script part with better error handling
-  const attachmentScript = processedAttachments.length > 0 
-    ? processedAttachments.map(filePath => {
-      const escapedPath = filePath.replace(/"/g, '\\"');
-      return `
+  const attachmentScript =
+    processedAttachments.length > 0
+      ? processedAttachments
+          .map((filePath) => {
+            const escapedPath = escapeForAppleScript(filePath);
+            return `
         try
           set attachmentFile to POSIX file "${escapedPath}"
           make new attachment at msg with properties {file:attachmentFile}
@@ -572,8 +722,9 @@ async function sendEmail(
           log "Failed to attach file: ${escapedPath} - Error: " & errMsg
         end try
       `;
-    }).join('\n')
-    : '';
+          })
+          .join("\n")
+      : "";
 
   // Try approach 1: Using specific syntax for creating a message with attachments
   try {
@@ -581,25 +732,25 @@ async function sendEmail(
       tell application "Microsoft Outlook"
         try
           set msg to make new outgoing message with properties {subject:"${escapedSubject}"}
-          
-          ${isHtml ? 
-            `set content type of msg to HTML
-             set content of msg to "${escapedBody}"` 
-          : 
-            `set content of msg to "${escapedBody}"`
+
+          ${
+            isHtml
+              ? `set content type of msg to HTML
+             set content of msg to "${escapedBody}"`
+              : `set content of msg to "${escapedBody}"`
           }
-          
+
           tell msg
-            set recipTo to make new to recipient with properties {email address:{name:"${toName}", address:"${to}"}}
-            ${cc ? `set recipCc to make new cc recipient with properties {email address:{name:"${ccName}", address:"${cc}"}}` : ''}
-            ${bcc ? `set recipBcc to make new bcc recipient with properties {email address:{name:"${bccName}", address:"${bcc}"}}` : ''}
-            
+            set recipTo to make new to recipient with properties {email address:{name:"${escapeForAppleScript(toName)}", address:"${escapeForAppleScript(to)}"}}
+            ${cc ? `set recipCc to make new cc recipient with properties {email address:{name:"${escapeForAppleScript(ccName)}", address:"${escapeForAppleScript(cc)}"}}` : ""}
+            ${bcc ? `set recipBcc to make new bcc recipient with properties {email address:{name:"${escapeForAppleScript(bccName)}", address:"${escapeForAppleScript(bcc)}"}}` : ""}
+
             ${attachmentScript}
           end tell
-          
+
           -- Delay to allow attachments to be processed
           delay 1
-          
+
           send msg
           return "Email sent successfully with attachments"
         on error errMsg
@@ -607,19 +758,19 @@ async function sendEmail(
         end try
       end tell
     `;
-    
+
     console.error("[sendEmail] Executing AppleScript method 1");
     const result = await runAppleScript(script1);
     console.error(`[sendEmail] Result (method 1): ${result}`);
-    
+
     if (result.startsWith("Error:")) {
       throw new Error(result);
     }
-    
+
     return result;
   } catch (error1) {
     console.error("[sendEmail] Method 1 failed:", error1);
-    
+
     // Try approach 2: Using AppleScript's draft window method
     try {
       const script2 = `
@@ -628,21 +779,22 @@ async function sendEmail(
             set newDraft to make new draft window
             set theMessage to item 1 of mail items of newDraft
             set subject of theMessage to "${escapedSubject}"
-            
-            ${isHtml ? 
-              `set content type of theMessage to HTML
-               set content of theMessage to "${escapedBody}"` 
-            : 
-              `set content of theMessage to "${escapedBody}"`
+
+            ${
+              isHtml
+                ? `set content type of theMessage to HTML
+               set content of theMessage to "${escapedBody}"`
+                : `set content of theMessage to "${escapedBody}"`
             }
-            
-            set to recipients of theMessage to {"${to}"}
-            ${cc ? `set cc recipients of theMessage to {"${cc}"}` : ''}
-            ${bcc ? `set bcc recipients of theMessage to {"${bcc}"}` : ''}
-            
-            ${processedAttachments.map(filePath => {
-              const escapedPath = filePath.replace(/"/g, '\\"');
-              return `
+
+            set to recipients of theMessage to {"${escapeForAppleScript(to)}"}
+            ${cc ? `set cc recipients of theMessage to {"${escapeForAppleScript(cc)}"}` : ""}
+            ${bcc ? `set bcc recipients of theMessage to {"${escapeForAppleScript(bcc)}"}` : ""}
+
+            ${processedAttachments
+              .map((filePath) => {
+                const escapedPath = escapeForAppleScript(filePath);
+                return `
                 try
                   set attachmentFile to POSIX file "${escapedPath}"
                   make new attachment at theMessage with properties {file:attachmentFile}
@@ -651,11 +803,12 @@ async function sendEmail(
                   log "Failed to attach file: ${escapedPath} - Error: " & attachErrMsg
                 end try
               `;
-            }).join('\n')}
-            
+              })
+              .join("\n")}
+
             -- Delay to allow attachments to be processed
             delay 1
-            
+
             send theMessage
             return "Email sent successfully with method 2"
           on error errMsg
@@ -663,40 +816,41 @@ async function sendEmail(
           end try
         end tell
       `;
-      
+
       console.error("[sendEmail] Executing AppleScript method 2");
       const result = await runAppleScript(script2);
       console.error(`[sendEmail] Result (method 2): ${result}`);
-      
+
       if (result.startsWith("Error:")) {
         throw new Error(result);
       }
-      
+
       return result;
     } catch (error2) {
       console.error("[sendEmail] Method 2 failed:", error2);
-      
+
       // Try approach 3: Create a draft for the user to manually send
       try {
         const script3 = `
           tell application "Microsoft Outlook"
             try
               set newMessage to make new outgoing message with properties {subject:"${escapedSubject}", visible:true}
-              
-              ${isHtml ? 
-                `set content type of newMessage to HTML
-                 set content of newMessage to "${escapedBody}"` 
-              : 
-                `set content of newMessage to "${escapedBody}"`
+
+              ${
+                isHtml
+                  ? `set content type of newMessage to HTML
+                 set content of newMessage to "${escapedBody}"`
+                  : `set content of newMessage to "${escapedBody}"`
               }
-              
-              set to recipients of newMessage to {"${to}"}
-              ${cc ? `set cc recipients of newMessage to {"${cc}"}` : ''}
-              ${bcc ? `set bcc recipients of newMessage to {"${bcc}"}` : ''}
-              
-              ${processedAttachments.map(filePath => {
-                const escapedPath = filePath.replace(/"/g, '\\"');
-                return `
+
+              set to recipients of newMessage to {"${escapeForAppleScript(to)}"}
+              ${cc ? `set cc recipients of newMessage to {"${escapeForAppleScript(cc)}"}` : ""}
+              ${bcc ? `set bcc recipients of newMessage to {"${escapeForAppleScript(bcc)}"}` : ""}
+
+              ${processedAttachments
+                .map((filePath) => {
+                  const escapedPath = escapeForAppleScript(filePath);
+                  return `
                   try
                     set attachmentFile to POSIX file "${escapedPath}"
                     make new attachment at newMessage with properties {file:attachmentFile}
@@ -705,8 +859,9 @@ async function sendEmail(
                     log "Failed to attach file: ${escapedPath} - Error: " & attachErrMsg
                   end try
                 `;
-              }).join('\n')}
-              
+                })
+                .join("\n")}
+
               -- Display the message
               activate
               return "Email draft created with attachments. Please review and send manually."
@@ -715,58 +870,65 @@ async function sendEmail(
             end try
           end tell
         `;
-        
+
         console.error("[sendEmail] Executing AppleScript method 3");
         const result = await runAppleScript(script3);
         console.error(`[sendEmail] Result (method 3): ${result}`);
-        
+
         if (result.startsWith("Error:")) {
           throw new Error(result);
         }
-        
+
         return "A draft has been created in Outlook with the content and attachments. Please review and send it manually.";
       } catch (error3) {
         console.error("[sendEmail] All methods failed:", error3);
-        throw new Error(`Could not send or create email. Please check if Outlook is properly configured and that you have granted necessary permissions. Error details: ${error3}`);
+        throw new Error(
+          `Could not send or create email. Please check if Outlook is properly configured and that you have granted necessary permissions. Error details: ${error3}`,
+        );
       }
     }
   }
 }
 // Function to get mail folders - this works based on your logs
 async function getMailFolders(): Promise<string[]> {
-    console.error("[getMailFolders] Getting mail folders");
-    await checkOutlookAccess();
-  
-    const script = `
+  console.error("[getMailFolders] Getting mail folders");
+  await checkOutlookAccess();
+
+  const script = `
       tell application "Microsoft Outlook"
         set folderNames to {}
         set allFolders to mail folders
-        
+
         repeat with theFolder in allFolders
           set end of folderNames to name of theFolder
         end repeat
-        
+
         return folderNames
       end tell
     `;
-  
-    try {
-      const result = await runAppleScript(script);
-      console.error(`[getMailFolders] Result: ${result}`);
-      return result.split(", ");
-    } catch (error) {
-      console.error("[getMailFolders] Error getting mail folders:", error);
-      throw error;
-    }
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[getMailFolders] Result: ${result}`);
+    return result.split(", ");
+  } catch (error) {
+    console.error("[getMailFolders] Error getting mail folders:", error);
+    throw error;
   }
-  
-  // Function to read emails in a folder that uses simple AppleScript
-async function readEmails(folder: string = "Inbox", limit: number = 10): Promise<any[]> {
-    console.error(`[readEmails] Reading emails from folder: ${folder}, limit: ${limit}`);
-    await checkOutlookAccess();
-    
-    // Use a simplified approach that should be more compatible
-    const script = `
+}
+
+// Function to read emails in a folder that uses simple AppleScript
+async function readEmails(
+  folder: string = "Inbox",
+  limit: number = 10,
+): Promise<any[]> {
+  console.error(
+    `[readEmails] Reading emails from folder: ${folder}, limit: ${limit}`,
+  );
+  await checkOutlookAccess();
+
+  // Use a simplified approach that should be more compatible
+  const script = `
       tell application "Microsoft Outlook"
         try
           -- Get the folder by name safely
@@ -778,23 +940,23 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
               exit repeat
             end if
           end repeat
-          
+
           if targetFolder is null then set targetFolder to inbox
-          
+
           -- Get messages
           set messageList to {}
           set msgCount to 0
           set allMsgs to messages of targetFolder
-          
+
           repeat with i from 1 to (count of allMsgs)
             if msgCount >= ${limit} then exit repeat
-            
+
             try
               set theMsg to item i of allMsgs
               set msgSubject to subject of theMsg
               set msgSender to sender of theMsg
               set msgDate to time sent of theMsg
-              
+
               -- Create a simple text representation for the message
               set msgInfo to msgSubject & " | " & msgSender & " | " & msgDate
               set end of messageList to msgInfo
@@ -803,39 +965,41 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
               -- Skip problematic messages
             end try
           end repeat
-          
+
           return messageList
         on error errMsg
           return "Error: " & errMsg
         end try
       end tell
     `;
-    
-    try {
-      const result = await runAppleScript(script);
-      
-      if (result.startsWith("Error:")) {
-        throw new Error(result);
-      }
-      
-      // Parse the results in a simple format
-      const emails = result.split(", ").map(msgInfo => {
-        const parts = msgInfo.split(" | ");
-        return {
-          subject: parts[0] || "No subject",
-          sender: parts[1] || "Unknown sender",
-          dateSent: parts[2] || new Date().toString(),
-          content: "Content not retrieved in simple mode"
-        };
-      });
-      
-      console.error(`[readEmails] Found ${emails.length} emails using simplified approach`);
-      return emails;
-    } catch (error) {
-      console.error("[readEmails] Error reading emails:", error);
-      throw error;
+
+  try {
+    const result = await runAppleScript(script);
+
+    if (result.startsWith("Error:")) {
+      throw new Error(result);
     }
+
+    // Parse the results in a simple format
+    const emails = result.split(", ").map((msgInfo) => {
+      const parts = msgInfo.split(" | ");
+      return {
+        subject: parts[0] || "No subject",
+        sender: parts[1] || "Unknown sender",
+        dateSent: parts[2] || new Date().toString(),
+        content: "Content not retrieved in simple mode",
+      };
+    });
+
+    console.error(
+      `[readEmails] Found ${emails.length} emails using simplified approach`,
+    );
+    return emails;
+  } catch (error) {
+    console.error("[readEmails] Error reading emails:", error);
+    throw error;
   }
+}
 
 // ====================================================
 // 5. CALENDAR FUNCTIONS
@@ -845,7 +1009,7 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
 async function getTodayEvents(limit: number = 10): Promise<any[]> {
   console.error(`[getTodayEvents] Getting today's events, limit: ${limit}`);
   await checkOutlookAccess();
-  
+
   const script = `
     tell application "Microsoft Outlook"
       set todayEvents to {}
@@ -853,16 +1017,16 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
       set todayDate to current date
       set startOfDay to todayDate - (time of todayDate)
       set endOfDay to startOfDay + 1 * days
-      
+
       set eventList to events of theCalendar whose start time is greater than or equal to startOfDay and start time is less than endOfDay
-      
+
       set eventCount to count of eventList
       set limitCount to ${limit}
-      
+
       if eventCount < limitCount then
         set limitCount to eventCount
       end if
-      
+
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
         set eventData to {subject:subject of theEvent, ¬
@@ -870,52 +1034,55 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
                      end:end time of theEvent, ¬
                      location:location of theEvent, ¬
                      id:id of theEvent}
-        
+
         set end of todayEvents to eventData
       end repeat
-      
+
       return todayEvents
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[getTodayEvents] Raw result length: ${result.length}`);
-    
+
     // Parse the results
     const events = [];
     const matches = result.match(/\{([^}]+)\}/g);
-    
+
     if (matches && matches.length > 0) {
       for (const match of matches) {
         try {
-          const props = match.substring(1, match.length - 1).split(',');
+          const props = match.substring(1, match.length - 1).split(",");
           const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
+
+          props.forEach((prop) => {
+            const parts = prop.split(":");
             if (parts.length >= 2) {
               const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
+              const value = parts.slice(1).join(":").trim();
               event[key] = value;
             }
           });
-          
+
           if (event.subject) {
             events.push({
               subject: event.subject,
               start: event.start,
               end: event.end,
               location: event.location || "No location",
-              id: event.id
+              id: event.id,
             });
           }
         } catch (parseError) {
-          console.error('[getTodayEvents] Error parsing event match:', parseError);
+          console.error(
+            "[getTodayEvents] Error parsing event match:",
+            parseError,
+          );
         }
       }
     }
-    
+
     console.error(`[getTodayEvents] Found ${events.length} events for today`);
     return events;
   } catch (error) {
@@ -925,10 +1092,15 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
 }
 
 // Function to get upcoming calendar events
-async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<any[]> {
-  console.error(`[getUpcomingEvents] Getting upcoming events for next ${days} days, limit: ${limit}`);
+async function getUpcomingEvents(
+  days: number = 7,
+  limit: number = 10,
+): Promise<any[]> {
+  console.error(
+    `[getUpcomingEvents] Getting upcoming events for next ${days} days, limit: ${limit}`,
+  );
   await checkOutlookAccess();
-  
+
   const script = `
     tell application "Microsoft Outlook"
       set upcomingEvents to {}
@@ -936,16 +1108,16 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
       set todayDate to current date
       set startOfToday to todayDate - (time of todayDate)
       set endDate to startOfToday + ${days} * days
-      
+
       set eventList to events of theCalendar whose start time is greater than or equal to todayDate and start time is less than endDate
-      
+
       set eventCount to count of eventList
       set limitCount to ${limit}
-      
+
       if eventCount < limitCount then
         set limitCount to eventCount
       end if
-      
+
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
         set eventData to {subject:subject of theEvent, ¬
@@ -953,52 +1125,55 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
                      end:end time of theEvent, ¬
                      location:location of theEvent, ¬
                      id:id of theEvent}
-        
+
         set end of upcomingEvents to eventData
       end repeat
-      
+
       return upcomingEvents
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[getUpcomingEvents] Raw result length: ${result.length}`);
-    
+
     // Parse the results
     const events = [];
     const matches = result.match(/\{([^}]+)\}/g);
-    
+
     if (matches && matches.length > 0) {
       for (const match of matches) {
         try {
-          const props = match.substring(1, match.length - 1).split(',');
+          const props = match.substring(1, match.length - 1).split(",");
           const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
+
+          props.forEach((prop) => {
+            const parts = prop.split(":");
             if (parts.length >= 2) {
               const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
+              const value = parts.slice(1).join(":").trim();
               event[key] = value;
             }
           });
-          
+
           if (event.subject) {
             events.push({
               subject: event.subject,
               start: event.start,
               end: event.end,
               location: event.location || "No location",
-              id: event.id
+              id: event.id,
             });
           }
         } catch (parseError) {
-          console.error('[getUpcomingEvents] Error parsing event match:', parseError);
+          console.error(
+            "[getUpcomingEvents] Error parsing event match:",
+            parseError,
+          );
         }
       }
     }
-    
+
     console.error(`[getUpcomingEvents] Found ${events.length} upcoming events`);
     return events;
   } catch (error) {
@@ -1008,18 +1183,23 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
 }
 
 // Function to search calendar events
-async function searchEvents(searchTerm: string, limit: number = 10): Promise<any[]> {
-  console.error(`[searchEvents] Searching for events with term: "${searchTerm}", limit: ${limit}`);
+async function searchEvents(
+  searchTerm: string,
+  limit: number = 10,
+): Promise<any[]> {
+  console.error(
+    `[searchEvents] Searching for events with term: "${searchTerm}", limit: ${limit}`,
+  );
   await checkOutlookAccess();
-  
+
   const script = `
     tell application "Microsoft Outlook"
       set searchResults to {}
       set theCalendar to default calendar
       set allEvents to events of theCalendar
       set i to 0
-      set searchString to "${searchTerm.replace(/"/g, '\\"')}"
-      
+      set searchString to "${escapeForAppleScript(searchTerm)}"
+
       repeat with theEvent in allEvents
         if (subject of theEvent contains searchString) or (location of theEvent contains searchString) then
           set i to i + 1
@@ -1028,58 +1208,61 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
                        end:end time of theEvent, ¬
                        location:location of theEvent, ¬
                        id:id of theEvent}
-          
+
           set end of searchResults to eventData
-          
+
           -- Stop if we've reached the limit
           if i >= ${limit} then
             exit repeat
           end if
         end if
       end repeat
-      
+
       return searchResults
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[searchEvents] Raw result length: ${result.length}`);
-    
+
     // Parse the results
     const events = [];
     const matches = result.match(/\{([^}]+)\}/g);
-    
+
     if (matches && matches.length > 0) {
       for (const match of matches) {
         try {
-          const props = match.substring(1, match.length - 1).split(',');
+          const props = match.substring(1, match.length - 1).split(",");
           const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
+
+          props.forEach((prop) => {
+            const parts = prop.split(":");
             if (parts.length >= 2) {
               const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
+              const value = parts.slice(1).join(":").trim();
               event[key] = value;
             }
           });
-          
+
           if (event.subject) {
             events.push({
               subject: event.subject,
               start: event.start,
               end: event.end,
               location: event.location || "No location",
-              id: event.id
+              id: event.id,
             });
           }
         } catch (parseError) {
-          console.error('[searchEvents] Error parsing event match:', parseError);
+          console.error(
+            "[searchEvents] Error parsing event match:",
+            parseError,
+          );
         }
       }
     }
-    
+
     console.error(`[searchEvents] Found ${events.length} matching events`);
     return events;
   } catch (error) {
@@ -1089,58 +1272,67 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
 }
 
 // Function to create a calendar event
-async function createEvent(subject: string, start: string, end: string, location?: string, body?: string, attendees?: string): Promise<string> {
-  console.error(`[createEvent] Creating event: "${subject}", start: ${start}, end: ${end}`);
+async function createEvent(
+  subject: string,
+  start: string,
+  end: string,
+  location?: string,
+  body?: string,
+  attendees?: string,
+): Promise<string> {
+  console.error(
+    `[createEvent] Creating event: "${subject}", start: ${start}, end: ${end}`,
+  );
   await checkOutlookAccess();
-  
+
   // Parse the ISO date strings to a format AppleScript can understand
   const startDate = new Date(start);
   const endDate = new Date(end);
-  
+
   // Format for AppleScript (month/day/year hour:minute:second)
   const formattedStart = `date "${startDate.getMonth() + 1}/${startDate.getDate()}/${startDate.getFullYear()} ${startDate.getHours()}:${startDate.getMinutes()}:${startDate.getSeconds()}"`;
   const formattedEnd = `date "${endDate.getMonth() + 1}/${endDate.getDate()}/${endDate.getFullYear()} ${endDate.getHours()}:${endDate.getMinutes()}:${endDate.getSeconds()}"`;
-  
+
   // Escape strings for AppleScript
-  const escapedSubject = subject.replace(/"/g, '\\"');
-  const escapedLocation = location ? location.replace(/"/g, '\\"') : "";
-  const escapedBody = body ? body.replace(/"/g, '\\"') : "";
-  
+  const escapedSubject = escapeForAppleScript(subject);
+  const escapedLocation = location ? escapeForAppleScript(location) : "";
+  const escapedBody = body ? escapeForAppleScript(body) : "";
+
   let script = `
     tell application "Microsoft Outlook"
       set theCalendar to default calendar
       set newEvent to make new calendar event at theCalendar with properties {subject:"${escapedSubject}", start time:${formattedStart}, end time:${formattedEnd}
   `;
-  
+
   if (location) {
     script += `, location:"${escapedLocation}"`;
   }
-  
+
   if (body) {
     script += `, content:"${escapedBody}"`;
   }
-  
+
   script += `}
   `;
-  
+
   // Add attendees if provided
   if (attendees) {
-    const attendeeList = attendees.split(',').map(email => email.trim());
-    
+    const attendeeList = attendees.split(",").map((email) => email.trim());
+
     for (const attendee of attendeeList) {
-      const escapedAttendee = attendee.replace(/"/g, '\\"');
+      const escapedAttendee = escapeForAppleScript(attendee);
       script += `
         make new attendee at newEvent with properties {email address:"${escapedAttendee}"}
       `;
     }
   }
-  
+
   script += `
       save newEvent
       return "Event created successfully"
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[createEvent] Result: ${result}`);
@@ -1157,29 +1349,29 @@ async function createEvent(subject: string, start: string, end: string, location
 
 // Function to list contacts with improved AppleScript syntax
 async function listContacts(limit: number = 20): Promise<any[]> {
-    console.error(`[listContacts] Listing contacts, limit: ${limit}`);
-    await checkOutlookAccess();
-    
-    const script = `
+  console.error(`[listContacts] Listing contacts, limit: ${limit}`);
+  await checkOutlookAccess();
+
+  const script = `
       tell application "Microsoft Outlook"
         set contactList to {}
         set allContactsList to contacts
         set contactCount to count of allContactsList
         set limitCount to ${limit}
-        
+
         if contactCount < limitCount then
           set limitCount to contactCount
         end if
-        
+
         repeat with i from 1 to limitCount
           try
             set theContact to item i of allContactsList
             set contactName to full name of theContact
-            
+
             -- Create a basic object with name
             set contactData to {name:contactName}
-            
-            -- Try to get email 
+
+            -- Try to get email
             try
               set emailList to email addresses of theContact
               if (count of emailList) > 0 then
@@ -1191,7 +1383,7 @@ async function listContacts(limit: number = 20): Promise<any[]> {
             on error
               set contactData to contactData & {email:"No email"}
             end try
-            
+
             -- Try to get phone
             try
               set phoneList to phones of theContact
@@ -1204,70 +1396,73 @@ async function listContacts(limit: number = 20): Promise<any[]> {
             on error
               set contactData to contactData & {phone:"No phone"}
             end try
-            
+
             set end of contactList to contactData
           on error
             -- Skip contacts that can't be processed
           end try
         end repeat
-        
+
         return contactList
       end tell
     `;
-    
-    try {
-      const result = await runAppleScript(script);
-      console.error(`[listContacts] Raw result length: ${result.length}`);
-      
-      // Parse the results
-      const contacts = [];
-      const matches = result.match(/\{([^}]+)\}/g);
-      
-      if (matches && matches.length > 0) {
-        for (const match of matches) {
-          try {
-            const props = match.substring(1, match.length - 1).split(',');
-            const contact: any = {};
-            
-            props.forEach(prop => {
-              const parts = prop.split(':');
-              if (parts.length >= 2) {
-                const key = parts[0].trim();
-                const value = parts.slice(1).join(':').trim();
-                contact[key] = value;
-              }
-            });
-            
-            if (contact.name) {
-              contacts.push({
-                name: contact.name,
-                email: contact.email || "No email",
-                phone: contact.phone || "No phone"
-              });
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[listContacts] Raw result length: ${result.length}`);
+
+    // Parse the results
+    const contacts = [];
+    const matches = result.match(/\{([^}]+)\}/g);
+
+    if (matches && matches.length > 0) {
+      for (const match of matches) {
+        try {
+          const props = match.substring(1, match.length - 1).split(",");
+          const contact: any = {};
+
+          props.forEach((prop) => {
+            const parts = prop.split(":");
+            if (parts.length >= 2) {
+              const key = parts[0].trim();
+              const value = parts.slice(1).join(":").trim();
+              contact[key] = value;
             }
-          } catch (parseError) {
-            console.error('[listContacts] Error parsing contact match:', parseError);
+          });
+
+          if (contact.name) {
+            contacts.push({
+              name: contact.name,
+              email: contact.email || "No email",
+              phone: contact.phone || "No phone",
+            });
           }
+        } catch (parseError) {
+          console.error(
+            "[listContacts] Error parsing contact match:",
+            parseError,
+          );
         }
       }
-      
-      console.error(`[listContacts] Found ${contacts.length} contacts`);
-      return contacts;
-    } catch (error) {
-      console.error("[listContacts] Error listing contacts:", error);
-      
-      // Try an alternative approach using a simpler script
-      try {
-        const alternativeScript = `
+    }
+
+    console.error(`[listContacts] Found ${contacts.length} contacts`);
+    return contacts;
+  } catch (error) {
+    console.error("[listContacts] Error listing contacts:", error);
+
+    // Try an alternative approach using a simpler script
+    try {
+      const alternativeScript = `
           tell application "Microsoft Outlook"
             set contactList to {}
             set contactCount to count of contacts
             set limitCount to ${limit}
-            
+
             if contactCount < limitCount then
               set limitCount to contactCount
             end if
-            
+
             repeat with i from 1 to limitCount
               try
                 set theContact to item i of contacts
@@ -1275,53 +1470,62 @@ async function listContacts(limit: number = 20): Promise<any[]> {
                 set end of contactList to contactName
               end try
             end repeat
-            
+
             return contactList
           end tell
         `;
-        
-        const result = await runAppleScript(alternativeScript);
-        
-        // Parse the simpler result format (just names)
-        const simplifiedContacts = result.split(", ").map(name => ({
-          name: name,
-          email: "Not available with simplified method",
-          phone: "Not available with simplified method"
-        }));
-        
-        console.error(`[listContacts] Found ${simplifiedContacts.length} contacts using alternative method`);
-        return simplifiedContacts;
-      } catch (altError) {
-        console.error("[listContacts] Alternative method also failed:", altError);
-        throw new Error(`Error accessing contacts. The error might be related to Outlook permissions or configuration: ${error instanceof Error ? error.message : String(error)}`);
-      }
+
+      const result = await runAppleScript(alternativeScript);
+
+      // Parse the simpler result format (just names)
+      const simplifiedContacts = result.split(", ").map((name) => ({
+        name: name,
+        email: "Not available with simplified method",
+        phone: "Not available with simplified method",
+      }));
+
+      console.error(
+        `[listContacts] Found ${simplifiedContacts.length} contacts using alternative method`,
+      );
+      return simplifiedContacts;
+    } catch (altError) {
+      console.error("[listContacts] Alternative method also failed:", altError);
+      throw new Error(
+        `Error accessing contacts. The error might be related to Outlook permissions or configuration: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
+}
 
 // Function to search contacts
 // Function to search contacts with improved AppleScript syntax
-async function searchContacts(searchTerm: string, limit: number = 10): Promise<any[]> {
-    console.error(`[searchContacts] Searching for contacts with term: "${searchTerm}", limit: ${limit}`);
-    await checkOutlookAccess();
-    
-    const script = `
+async function searchContacts(
+  searchTerm: string,
+  limit: number = 10,
+): Promise<any[]> {
+  console.error(
+    `[searchContacts] Searching for contacts with term: "${searchTerm}", limit: ${limit}`,
+  );
+  await checkOutlookAccess();
+
+  const script = `
       tell application "Microsoft Outlook"
         set searchResults to {}
         set allContacts to contacts
         set i to 0
-        set searchString to "${searchTerm.replace(/"/g, '\\"')}"
-        
+        set searchString to "${escapeForAppleScript(searchTerm)}"
+
         repeat with theContact in allContacts
           try
             set contactName to full name of theContact
-            
+
             if contactName contains searchString then
               set i to i + 1
-              
+
               -- Create basic contact info
               set contactData to {name:contactName}
-              
-              -- Try to get email 
+
+              -- Try to get email
               try
                 set emailList to email addresses of theContact
                 if (count of emailList) > 0 then
@@ -1333,7 +1537,7 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
               on error
                 set contactData to contactData & {email:"No email"}
               end try
-              
+
               -- Try to get phone
               try
                 set phoneList to phones of theContact
@@ -1346,9 +1550,9 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
               on error
                 set contactData to contactData & {phone:"No phone"}
               end try
-              
+
               set end of searchResults to contactData
-              
+
               -- Stop if we've reached the limit
               if i >= ${limit} then
                 exit repeat
@@ -1358,60 +1562,65 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
             -- Skip contacts that can't be processed
           end try
         end repeat
-        
+
         return searchResults
       end tell
     `;
-    
-    try {
-      const result = await runAppleScript(script);
-      console.error(`[searchContacts] Raw result length: ${result.length}`);
-      
-      // Parse the results
-      const contacts = [];
-      const matches = result.match(/\{([^}]+)\}/g);
-      
-      if (matches && matches.length > 0) {
-        for (const match of matches) {
-          try {
-            const props = match.substring(1, match.length - 1).split(',');
-            const contact: any = {};
-            
-            props.forEach(prop => {
-              const parts = prop.split(':');
-              if (parts.length >= 2) {
-                const key = parts[0].trim();
-                const value = parts.slice(1).join(':').trim();
-                contact[key] = value;
-              }
-            });
-            
-            if (contact.name) {
-              contacts.push({
-                name: contact.name,
-                email: contact.email || "No email",
-                phone: contact.phone || "No phone"
-              });
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[searchContacts] Raw result length: ${result.length}`);
+
+    // Parse the results
+    const contacts = [];
+    const matches = result.match(/\{([^}]+)\}/g);
+
+    if (matches && matches.length > 0) {
+      for (const match of matches) {
+        try {
+          const props = match.substring(1, match.length - 1).split(",");
+          const contact: any = {};
+
+          props.forEach((prop) => {
+            const parts = prop.split(":");
+            if (parts.length >= 2) {
+              const key = parts[0].trim();
+              const value = parts.slice(1).join(":").trim();
+              contact[key] = value;
             }
-          } catch (parseError) {
-            console.error('[searchContacts] Error parsing contact match:', parseError);
+          });
+
+          if (contact.name) {
+            contacts.push({
+              name: contact.name,
+              email: contact.email || "No email",
+              phone: contact.phone || "No phone",
+            });
           }
+        } catch (parseError) {
+          console.error(
+            "[searchContacts] Error parsing contact match:",
+            parseError,
+          );
         }
       }
-      
-      console.error(`[searchContacts] Found ${contacts.length} matching contacts`);
-      return contacts;
-    } catch (error) {
-      console.error("[searchContacts] Error searching contacts:", error);
-      
-      // Try an alternative approach with a simpler script that just returns names
-      try {
-        const alternativeScript = `
+    }
+
+    console.error(
+      `[searchContacts] Found ${contacts.length} matching contacts`,
+    );
+    return contacts;
+  } catch (error) {
+    console.error("[searchContacts] Error searching contacts:", error);
+
+    // Try an alternative approach with a simpler script that just returns names
+    try {
+      const alternativeScript = `
           tell application "Microsoft Outlook"
             set matchingContacts to {}
-            set searchString to "${searchTerm.replace(/"/g, '\\"')}"
+            set searchString to "${escapeForAppleScript(searchTerm)}"
             set i to 0
-            
+
             repeat with theContact in contacts
               try
                 set contactName to full name of theContact
@@ -1422,28 +1631,35 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
                 end if
               end try
             end repeat
-            
+
             return matchingContacts
           end tell
         `;
-        
-        const result = await runAppleScript(alternativeScript);
-        
-        // Parse the simpler result format (just names)
-        const simplifiedContacts = result.split(", ").map(name => ({
-          name: name,
-          email: "Not available with simplified method",
-          phone: "Not available with simplified method"
-        }));
-        
-        console.error(`[searchContacts] Found ${simplifiedContacts.length} contacts using alternative method`);
-        return simplifiedContacts;
-      } catch (altError) {
-        console.error("[searchContacts] Alternative method also failed:", altError);
-        throw new Error(`Error searching contacts. The error might be related to Outlook permissions or configuration: ${error instanceof Error ? error.message : String(error)}`);
-      }
+
+      const result = await runAppleScript(alternativeScript);
+
+      // Parse the simpler result format (just names)
+      const simplifiedContacts = result.split(", ").map((name) => ({
+        name: name,
+        email: "Not available with simplified method",
+        phone: "Not available with simplified method",
+      }));
+
+      console.error(
+        `[searchContacts] Found ${simplifiedContacts.length} contacts using alternative method`,
+      );
+      return simplifiedContacts;
+    } catch (altError) {
+      console.error(
+        "[searchContacts] Alternative method also failed:",
+        altError,
+      );
+      throw new Error(
+        `Error searching contacts. The error might be related to Outlook permissions or configuration: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
+}
 
 // ====================================================
 // 7. TYPE GUARDS
@@ -1464,23 +1680,27 @@ function isMailArgs(args: unknown): args is {
   attachments?: string[];
 } {
   if (typeof args !== "object" || args === null) return false;
-  
+
   const { operation } = args as any;
-  
-  if (!operation || !["unread", "search", "send", "folders", "read"].includes(operation)) {
+
+  if (
+    !operation ||
+    !["unread", "search", "send", "folders", "read"].includes(operation)
+  ) {
     return false;
   }
-  
+
   // Check required fields based on operation
   switch (operation) {
     case "search":
       if (!(args as any).searchTerm) return false;
       break;
     case "send":
-      if (!(args as any).to || !(args as any).subject || !(args as any).body) return false;
+      if (!(args as any).to || !(args as any).subject || !(args as any).body)
+        return false;
       break;
   }
-  
+
   return true;
 }
 
@@ -1497,23 +1717,27 @@ function isCalendarArgs(args: unknown): args is {
   attendees?: string;
 } {
   if (typeof args !== "object" || args === null) return false;
-  
+
   const { operation } = args as any;
-  
-  if (!operation || !["today", "upcoming", "search", "create"].includes(operation)) {
+
+  if (
+    !operation ||
+    !["today", "upcoming", "search", "create"].includes(operation)
+  ) {
     return false;
   }
-  
+
   // Check required fields based on operation
   switch (operation) {
     case "search":
       if (!(args as any).searchTerm) return false;
       break;
     case "create":
-      if (!(args as any).subject || !(args as any).start || !(args as any).end) return false;
+      if (!(args as any).subject || !(args as any).start || !(args as any).end)
+        return false;
       break;
   }
-  
+
   return true;
 }
 
@@ -1523,18 +1747,18 @@ function isContactsArgs(args: unknown): args is {
   limit?: number;
 } {
   if (typeof args !== "object" || args === null) return false;
-  
+
   const { operation } = args as any;
-  
+
   if (!operation || !["list", "search"].includes(operation)) {
     return false;
   }
-  
+
   // Check required fields based on operation
   if (operation === "search" && !(args as any).searchTerm) {
     return false;
   }
-  
+
   return true;
 }
 
@@ -1572,102 +1796,131 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           case "unread": {
             const emails = await getUnreadEmails(args.folder, args.limit);
             return {
-              content: [{ 
-                type: "text", 
-                text: emails.length > 0 ? 
-                  `Found ${emails.length} unread email(s)${args.folder ? ` in folder "${args.folder}"` : ''}\n\n` +
-                  emails.map(email => 
-                    `[${email.dateSent}] From: ${email.sender}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? '...' : ''}`
-                  ).join("\n\n") :
-                  `No unread emails found${args.folder ? ` in folder "${args.folder}"` : ''}`
-              }],
-              isError: false
+              content: [
+                {
+                  type: "text",
+                  text:
+                    emails.length > 0
+                      ? `Found ${emails.length} unread email(s)${args.folder ? ` in folder "${args.folder}"` : ""}\n\n` +
+                        emails
+                          .map(
+                            (email) =>
+                              `[${email.dateSent}] From: ${email.sender}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? "..." : ""}`,
+                          )
+                          .join("\n\n")
+                      : `No unread emails found${args.folder ? ` in folder "${args.folder}"` : ""}`,
+                },
+              ],
+              isError: false,
             };
           }
-          
+
           case "search": {
             if (!args.searchTerm) {
               throw new Error("Search term is required for search operation");
             }
-            const emails = await searchEmails(args.searchTerm, args.folder, args.limit);
+            const emails = await searchEmails(
+              args.searchTerm,
+              args.folder,
+              args.limit,
+            );
             return {
-              content: [{ 
-                type: "text", 
-                text: emails.length > 0 ? 
-                  `Found ${emails.length} email(s) for "${args.searchTerm}"${args.folder ? ` in folder "${args.folder}"` : ''}\n\n` +
-                  emails.map(email => 
-                    `[${email.dateSent}] From: ${email.sender}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? '...' : ''}`
-                  ).join("\n\n") :
-                  `No emails found for "${args.searchTerm}"${args.folder ? ` in folder "${args.folder}"` : ''}`
-              }],
-              isError: false
+              content: [
+                {
+                  type: "text",
+                  text:
+                    emails.length > 0
+                      ? `Found ${emails.length} email(s) for "${args.searchTerm}"${args.folder ? ` in folder "${args.folder}"` : ""}\n\n` +
+                        emails
+                          .map(
+                            (email) =>
+                              `[${email.dateSent}] From: ${email.sender}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? "..." : ""}`,
+                          )
+                          .join("\n\n")
+                      : `No emails found for "${args.searchTerm}"${args.folder ? ` in folder "${args.folder}"` : ""}`,
+                },
+              ],
+              isError: false,
             };
           }
-          
+
           // Update the handler in CallToolRequestSchema
           case "send": {
             if (!args.to || !args.subject || !args.body) {
-              throw new Error("Recipient (to), subject, and body are required for send operation");
+              throw new Error(
+                "Recipient (to), subject, and body are required for send operation",
+              );
             }
-            
+
             // Validate attachments if provided
             if (args.attachments && !Array.isArray(args.attachments)) {
               throw new Error("Attachments must be an array of file paths");
             }
-            
+
             // Log attachment information for debugging
-            console.error(`[CallTool] Send email with attachments: ${args.attachments ? JSON.stringify(args.attachments) : 'none'}`);
-            
-            const result = await sendEmail(
-              args.to, 
-              args.subject, 
-              args.body, 
-              args.cc, 
-              args.bcc, 
-              args.isHtml || false,
-              args.attachments
+            console.error(
+              `[CallTool] Send email with attachments: ${args.attachments ? JSON.stringify(args.attachments) : "none"}`,
             );
-            
+
+            const result = await sendEmail(
+              args.to,
+              args.subject,
+              args.body,
+              args.cc,
+              args.bcc,
+              args.isHtml || false,
+              args.attachments,
+            );
+
             return {
               content: [{ type: "text", text: result }],
-              isError: false
+              isError: false,
             };
           }
-          
+
           case "folders": {
             const folders = await getMailFolders();
             return {
-              content: [{ 
-                type: "text", 
-                text: folders.length > 0 ? 
-                  `Found ${folders.length} mail folders:\n\n${folders.join("\n")}` :
-                  "No mail folders found. Make sure Outlook is running and properly configured."
-              }],
-              isError: false
+              content: [
+                {
+                  type: "text",
+                  text:
+                    folders.length > 0
+                      ? `Found ${folders.length} mail folders:\n\n${folders.join("\n")}`
+                      : "No mail folders found. Make sure Outlook is running and properly configured.",
+                },
+              ],
+              isError: false,
             };
           }
-          
+
           case "read": {
             const emails = await readEmails(args.folder, args.limit);
             return {
-              content: [{ 
-                type: "text", 
-                text: emails.length > 0 ? 
-                  `Found ${emails.length} email(s)${args.folder ? ` in folder "${args.folder}"` : ''}\n\n` +
-                  emails.map(email => 
-                    `[${email.dateSent}] From: ${email.sender}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? '...' : ''}`
-                  ).join("\n\n") :
-                  `No emails found${args.folder ? ` in folder "${args.folder}"` : ''}`
-              }],
-              isError: false
+              content: [
+                {
+                  type: "text",
+                  text:
+                    emails.length > 0
+                      ? `Found ${emails.length} email(s)${args.folder ? ` in folder "${args.folder}"` : ""}\n\n` +
+                        emails
+                          .map(
+                            (email) =>
+                              `[${email.dateSent}] From: ${email.sender}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? "..." : ""}`,
+                          )
+                          .join("\n\n")
+                      : `No emails found${args.folder ? ` in folder "${args.folder}"` : ""}`,
+                },
+              ],
+              isError: false,
             };
           }
-          
+
           default:
             throw new Error(`Unknown mail operation: ${operation}`);
         }
       }
-      
+
       case "outlook_calendar": {
         if (!isCalendarArgs(args)) {
           throw new Error("Invalid arguments for outlook_calendar tool");
@@ -1680,71 +1933,98 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           case "today": {
             const events = await getTodayEvents(args.limit);
             return {
-              content: [{ 
-                type: "text", 
-                text: events.length > 0 ? 
-                  `Found ${events.length} event(s) for today:\n\n` +
-                  events.map(event => 
-                    `${event.subject}\nTime: ${event.start} - ${event.end}\nLocation: ${event.location}`
-                  ).join("\n\n") :
-                  "No events found for today"
-              }],
-              isError: false
+              content: [
+                {
+                  type: "text",
+                  text:
+                    events.length > 0
+                      ? `Found ${events.length} event(s) for today:\n\n` +
+                        events
+                          .map(
+                            (event) =>
+                              `${event.subject}\nTime: ${event.start} - ${event.end}\nLocation: ${event.location}`,
+                          )
+                          .join("\n\n")
+                      : "No events found for today",
+                },
+              ],
+              isError: false,
             };
           }
-          
+
           case "upcoming": {
             const days = args.days || 7;
             const events = await getUpcomingEvents(days, args.limit);
             return {
-              content: [{ 
-                type: "text", 
-                text: events.length > 0 ? 
-                  `Found ${events.length} upcoming event(s) for the next ${days} days:\n\n` +
-                  events.map(event => 
-                    `${event.subject}\nTime: ${event.start} - ${event.end}\nLocation: ${event.location}`
-                  ).join("\n\n") :
-                  `No upcoming events found for the next ${days} days`
-              }],
-              isError: false
+              content: [
+                {
+                  type: "text",
+                  text:
+                    events.length > 0
+                      ? `Found ${events.length} upcoming event(s) for the next ${days} days:\n\n` +
+                        events
+                          .map(
+                            (event) =>
+                              `${event.subject}\nTime: ${event.start} - ${event.end}\nLocation: ${event.location}`,
+                          )
+                          .join("\n\n")
+                      : `No upcoming events found for the next ${days} days`,
+                },
+              ],
+              isError: false,
             };
           }
-          
+
           case "search": {
             if (!args.searchTerm) {
               throw new Error("Search term is required for search operation");
             }
             const events = await searchEvents(args.searchTerm, args.limit);
             return {
-              content: [{ 
-                type: "text", 
-                text: events.length > 0 ? 
-                  `Found ${events.length} event(s) matching "${args.searchTerm}":\n\n` +
-                  events.map(event => 
-                    `${event.subject}\nTime: ${event.start} - ${event.end}\nLocation: ${event.location}`
-                  ).join("\n\n") :
-                  `No events found matching "${args.searchTerm}"`
-              }],
-              isError: false
+              content: [
+                {
+                  type: "text",
+                  text:
+                    events.length > 0
+                      ? `Found ${events.length} event(s) matching "${args.searchTerm}":\n\n` +
+                        events
+                          .map(
+                            (event) =>
+                              `${event.subject}\nTime: ${event.start} - ${event.end}\nLocation: ${event.location}`,
+                          )
+                          .join("\n\n")
+                      : `No events found matching "${args.searchTerm}"`,
+                },
+              ],
+              isError: false,
             };
           }
-          
+
           case "create": {
             if (!args.subject || !args.start || !args.end) {
-              throw new Error("Subject, start time, and end time are required for create operation");
+              throw new Error(
+                "Subject, start time, and end time are required for create operation",
+              );
             }
-            const result = await createEvent(args.subject, args.start, args.end, args.location, args.body, args.attendees);
+            const result = await createEvent(
+              args.subject,
+              args.start,
+              args.end,
+              args.location,
+              args.body,
+              args.attendees,
+            );
             return {
               content: [{ type: "text", text: result }],
-              isError: false
+              isError: false,
             };
           }
-          
+
           default:
             throw new Error(`Unknown calendar operation: ${operation}`);
         }
       }
-      
+
       case "outlook_contacts": {
         if (!isContactsArgs(args)) {
           throw new Error("Invalid arguments for outlook_contacts tool");
@@ -1757,38 +2037,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           case "list": {
             const contacts = await listContacts(args.limit);
             return {
-              content: [{ 
-                type: "text", 
-                text: contacts.length > 0 ? 
-                  `Found ${contacts.length} contact(s):\n\n` +
-                  contacts.map(contact => 
-                    `Name: ${contact.name}\nEmail: ${contact.email}\nPhone: ${contact.phone}`
-                  ).join("\n\n") :
-                  "No contacts found"
-              }],
-              isError: false
+              content: [
+                {
+                  type: "text",
+                  text:
+                    contacts.length > 0
+                      ? `Found ${contacts.length} contact(s):\n\n` +
+                        contacts
+                          .map(
+                            (contact) =>
+                              `Name: ${contact.name}\nEmail: ${contact.email}\nPhone: ${contact.phone}`,
+                          )
+                          .join("\n\n")
+                      : "No contacts found",
+                },
+              ],
+              isError: false,
             };
           }
-          
+
           case "search": {
             if (!args.searchTerm) {
               throw new Error("Search term is required for search operation");
             }
             const contacts = await searchContacts(args.searchTerm, args.limit);
             return {
-              content: [{ 
-                type: "text", 
-                text: contacts.length > 0 ? 
-                  `Found ${contacts.length} contact(s) matching "${args.searchTerm}":\n\n` +
-                  contacts.map(contact => 
-                    `Name: ${contact.name}\nEmail: ${contact.email}\nPhone: ${contact.phone}`
-                  ).join("\n\n") :
-                  `No contacts found matching "${args.searchTerm}"`
-              }],
-              isError: false
+              content: [
+                {
+                  type: "text",
+                  text:
+                    contacts.length > 0
+                      ? `Found ${contacts.length} contact(s) matching "${args.searchTerm}":\n\n` +
+                        contacts
+                          .map(
+                            (contact) =>
+                              `Name: ${contact.name}\nEmail: ${contact.email}\nPhone: ${contact.phone}`,
+                          )
+                          .join("\n\n")
+                      : `No contacts found matching "${args.searchTerm}"`,
+                },
+              ],
+              isError: false,
             };
           }
-          
+
           default:
             throw new Error(`Unknown contacts operation: ${operation}`);
         }
