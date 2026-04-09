@@ -1,0 +1,9 @@
+{
+  "attachments": {
+    "allowedDirectories": [
+      "~/Downloads",
+      "~/Documents",
+      "~/Desktop"
+    ]
+  }
+}
