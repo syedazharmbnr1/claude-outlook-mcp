@@ -7,6 +7,8 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { runAppleScript } from 'run-applescript';
+import os from 'os';
+import path from 'path';
 
 // ====================================================
 // 1. Tool Definitions
@@ -172,6 +174,26 @@ const server = new Server(
 // 3. Core Functions
 // ====================================================
 
+// Escape a string for safe interpolation inside an AppleScript double-quoted literal.
+// Backslashes must be escaped before quotes, otherwise a trailing backslash can
+// neutralise the quote escape and allow injection (e.g. the sequence \\" becomes
+// a literal backslash followed by an unescaped quote that terminates the string).
+function escapeAppleScriptString(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+// Resolve an attachment path and verify it is inside the user's home directory.
+// Rejects path-traversal attempts (e.g. ../../etc/passwd) and absolute paths
+// outside the home tree.
+function safeAttachmentPath(filePath: string): string {
+  const homeDir = os.homedir();
+  const resolved = path.resolve(filePath);
+  if (!resolved.startsWith(homeDir + path.sep) && resolved !== homeDir) {
+    throw new Error(`Attachment path is outside the home directory and was rejected: ${resolved}`);
+  }
+  return resolved;
+}
+
 // Check if Outlook is installed and running
 async function checkOutlookAccess(): Promise<boolean> {
   console.error("[checkOutlookAccess] Checking if Outlook is accessible...");
@@ -229,11 +251,17 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
   console.error(`[getUnreadEmails] Getting unread emails from folder: ${folder}, limit: ${limit}`);
   await checkOutlookAccess();
   
-  const folderPath = folder === "Inbox" ? "inbox" : folder;
+  const escapedFolderName = escapeAppleScriptString(folder);
   const script = `
     tell application "Microsoft Outlook"
       try
-        set theFolder to ${folderPath} -- Use the specified folder or default to inbox
+        -- Look up folder by name to avoid unquoted identifier injection
+        try
+          set targetFolder to (first mail folder whose name is "${escapedFolderName}")
+        on error
+          set targetFolder to inbox
+        end try
+        set theFolder to targetFolder
         set unreadMessages to {}
         set allMessages to messages of theFolder
         set i to 0
@@ -328,15 +356,21 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
   console.error(`[searchEmails] Searching for "${searchTerm}" in folder: ${folder}, limit: ${limit}`);
   await checkOutlookAccess();
   
-  const folderPath = folder === "Inbox" ? "inbox" : folder;
+  const escapedFolderName = escapeAppleScriptString(folder);
   const script = `
     tell application "Microsoft Outlook"
       try
-        set theFolder to ${folderPath}
+        -- Look up folder by name to avoid unquoted identifier injection
+        try
+          set targetFolder to (first mail folder whose name is "${escapedFolderName}")
+        on error
+          set targetFolder to inbox
+        end try
+        set theFolder to targetFolder
         set searchResults to {}
         set allMessages to messages of theFolder
         set i to 0
-        set searchString to "${searchTerm.replace(/"/g, '\\"')}"
+        set searchString to "${escapeAppleScriptString(searchTerm)}"
         
         repeat with theMessage in allMessages
           if (subject of theMessage contains searchString) or (content of theMessage contains searchString) then
@@ -422,95 +456,6 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
   }
 }
 
-async function checkAttachmentPath(filePath: string): Promise<string> {
-  try {
-    // Convert to absolute path if relative
-    let fullPath = filePath;
-    if (!filePath.startsWith('/')) {
-      const cwd = process.cwd();
-      fullPath = `${cwd}/${filePath}`;
-    }
-    
-    // Check if the file exists and is readable
-    const fs = require('fs');
-    const { promisify } = require('util');
-    const access = promisify(fs.access);
-    const stat = promisify(fs.stat);
-    
-    try {
-      await access(fullPath, fs.constants.R_OK);
-      const stats = await stat(fullPath);
-      
-      return `File exists and is readable: ${fullPath}\nSize: ${stats.size} bytes\nPermissions: ${stats.mode.toString(8)}\nLast modified: ${stats.mtime}`;
-    } catch (err) {
-      return `ERROR: Cannot access file: ${fullPath}\nError details: ${err.message}`;
-    }
-  } catch (error) {
-    return `Failed to check attachment path: ${error.message}`;
-  }
-}
-
-// Add a debug version of sending email with attachment to test if files are accessible
-async function debugSendEmailWithAttachment(
-  to: string,
-  subject: string,
-  body: string,
-  attachmentPath: string
-): Promise<string> {
-  // First check if the file exists and is readable
-  const fileStatus = await checkAttachmentPath(attachmentPath);
-  console.error(`[debugSendEmail] Attachment status: ${fileStatus}`);
-  
-  // Create a simple AppleScript that just attempts to open the file
-  const script = `
-    set theFile to POSIX file "${attachmentPath.replace(/"/g, '\\"')}"
-    try
-      tell application "Finder"
-        set fileExists to exists file theFile
-        set fileInfo to info for file theFile
-        return "File exists: " & fileExists & ", size: " & (size of fileInfo)
-      end tell
-    on error errMsg
-      return "Error accessing file: " & errMsg
-    end try
-  `;
-  
-  try {
-    const result = await runAppleScript(script);
-    console.error(`[debugSendEmail] AppleScript file check: ${result}`);
-    
-    // Now try to actually create a draft with the attachment
-    const emailScript = `
-      tell application "Microsoft Outlook"
-        try
-          set newMessage to make new outgoing message with properties {subject:"DEBUG: ${subject.replace(/"/g, '\\"')}", visible:true}
-          set content of newMessage to "${body.replace(/"/g, '\\"')}"
-          set to recipients of newMessage to {"${to}"}
-          
-          try
-            set attachmentFile to POSIX file "${attachmentPath.replace(/"/g, '\\"')}"
-            make new attachment at newMessage with properties {file:attachmentFile}
-            set attachResult to "Successfully attached file"
-          on error attachErrMsg
-            set attachResult to "Failed to attach file: " & attachErrMsg
-          end try
-          
-          return attachResult
-        on error errMsg
-          return "Error creating email: " & errMsg
-        end try
-      end tell
-    `;
-    
-    const attachResult = await runAppleScript(emailScript);
-    console.error(`[debugSendEmail] Attachment result: ${attachResult}`);
-    
-    return `File check: ${fileStatus}\n\nAttachment test: ${attachResult}`;
-  } catch (error) {
-    console.error("[debugSendEmail] Error during debug:", error);
-    return `Debugging error: ${error.message}\n\nFile check: ${fileStatus}`;
-  }
-}
 // Update the sendEmail function to handle attachments and HTML content
 async function sendEmail(
   to: string, 
@@ -541,28 +486,20 @@ async function sendEmail(
   const bccName = bcc ? extractNameFromEmail(bcc) : "";
 
   // Escape special characters
-  const escapedSubject = subject.replace(/"/g, '\\"');
-  const escapedBody = body.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-  
-  // Process attachments: Convert to absolute paths if they are relative
+  const escapedSubject = escapeAppleScriptString(subject);
+  const escapedBody = escapeAppleScriptString(body).replace(/\n/g, '\\n');
+
+  // Process attachments: resolve paths and reject anything outside home directory
   let processedAttachments: string[] = [];
   if (attachments && attachments.length > 0) {
-    processedAttachments = attachments.map(path => {
-      // Check if path is absolute (starts with /)
-      if (path.startsWith('/')) {
-        return path;
-      }
-      // Get current working directory and join with relative path
-      const cwd = process.cwd();
-      return `${cwd}/${path}`;
-    });
+    processedAttachments = attachments.map(p => safeAttachmentPath(p));
     console.error(`[sendEmail] Processed attachments: ${JSON.stringify(processedAttachments)}`);
   }
   
   // Create attachment script part with better error handling
-  const attachmentScript = processedAttachments.length > 0 
+  const attachmentScript = processedAttachments.length > 0
     ? processedAttachments.map(filePath => {
-      const escapedPath = filePath.replace(/"/g, '\\"');
+      const escapedPath = escapeAppleScriptString(filePath);
       return `
         try
           set attachmentFile to POSIX file "${escapedPath}"
@@ -590,9 +527,9 @@ async function sendEmail(
           }
           
           tell msg
-            set recipTo to make new to recipient with properties {email address:{name:"${toName}", address:"${to}"}}
-            ${cc ? `set recipCc to make new cc recipient with properties {email address:{name:"${ccName}", address:"${cc}"}}` : ''}
-            ${bcc ? `set recipBcc to make new bcc recipient with properties {email address:{name:"${bccName}", address:"${bcc}"}}` : ''}
+            set recipTo to make new to recipient with properties {email address:{name:"${escapeAppleScriptString(toName)}", address:"${escapeAppleScriptString(to)}"}}
+            ${cc ? `set recipCc to make new cc recipient with properties {email address:{name:"${escapeAppleScriptString(ccName)}", address:"${escapeAppleScriptString(cc)}"}}` : ''}
+            ${bcc ? `set recipBcc to make new bcc recipient with properties {email address:{name:"${escapeAppleScriptString(bccName)}", address:"${escapeAppleScriptString(bcc)}"}}` : ''}
             
             ${attachmentScript}
           end tell
@@ -636,12 +573,12 @@ async function sendEmail(
               `set content of theMessage to "${escapedBody}"`
             }
             
-            set to recipients of theMessage to {"${to}"}
-            ${cc ? `set cc recipients of theMessage to {"${cc}"}` : ''}
-            ${bcc ? `set bcc recipients of theMessage to {"${bcc}"}` : ''}
-            
+            set to recipients of theMessage to {"${escapeAppleScriptString(to)}"}
+            ${cc ? `set cc recipients of theMessage to {"${escapeAppleScriptString(cc)}"}` : ''}
+            ${bcc ? `set bcc recipients of theMessage to {"${escapeAppleScriptString(bcc)}"}` : ''}
+
             ${processedAttachments.map(filePath => {
-              const escapedPath = filePath.replace(/"/g, '\\"');
+              const escapedPath = escapeAppleScriptString(filePath);
               return `
                 try
                   set attachmentFile to POSIX file "${escapedPath}"
@@ -652,10 +589,10 @@ async function sendEmail(
                 end try
               `;
             }).join('\n')}
-            
+
             -- Delay to allow attachments to be processed
             delay 1
-            
+
             send theMessage
             return "Email sent successfully with method 2"
           on error errMsg
@@ -690,12 +627,12 @@ async function sendEmail(
                 `set content of newMessage to "${escapedBody}"`
               }
               
-              set to recipients of newMessage to {"${to}"}
-              ${cc ? `set cc recipients of newMessage to {"${cc}"}` : ''}
-              ${bcc ? `set bcc recipients of newMessage to {"${bcc}"}` : ''}
-              
+              set to recipients of newMessage to {"${escapeAppleScriptString(to)}"}
+              ${cc ? `set cc recipients of newMessage to {"${escapeAppleScriptString(cc)}"}` : ''}
+              ${bcc ? `set bcc recipients of newMessage to {"${escapeAppleScriptString(bcc)}"}` : ''}
+
               ${processedAttachments.map(filePath => {
-                const escapedPath = filePath.replace(/"/g, '\\"');
+                const escapedPath = escapeAppleScriptString(filePath);
                 return `
                   try
                     set attachmentFile to POSIX file "${escapedPath}"
@@ -766,20 +703,16 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
     await checkOutlookAccess();
     
     // Use a simplified approach that should be more compatible
+    const escapedFolderName = escapeAppleScriptString(folder);
     const script = `
       tell application "Microsoft Outlook"
         try
           -- Get the folder by name safely
-          set targetFolder to null
-          set allFolders to mail folders
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${folder}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          
-          if targetFolder is null then set targetFolder to inbox
+          try
+            set targetFolder to (first mail folder whose name is "${escapedFolderName}")
+          on error
+            set targetFolder to inbox
+          end try
           
           -- Get messages
           set messageList to {}
@@ -841,6 +774,72 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
 // 5. CALENDAR FUNCTIONS
 // ====================================================
 
+// Convert an AppleScript date string like "Tuesday, May 5, 2026 at 2:00:00 PM"
+// to a comparable minutes-since-midnight value (for same-day ordering only).
+function parseStartMinutes(start: string): number {
+  // Try 12-hour format first: "at 2:30:00 PM"
+  const m12 = start.match(/at (\d+):(\d+):\d+\s+(AM|PM)/i);
+  if (m12) {
+    let h = parseInt(m12[1]);
+    const min = parseInt(m12[2]);
+    const meridiem = m12[3].toUpperCase();
+    if (meridiem === 'PM' && h !== 12) h += 12;
+    if (meridiem === 'AM' && h === 12) h = 0;
+    return h * 60 + min;
+  }
+  // Fall back to 24-hour format: "at 14:30:00"
+  const m24 = start.match(/at (\d+):(\d+):\d+/);
+  if (m24) return parseInt(m24[1]) * 60 + parseInt(m24[2]);
+  return 0;
+}
+
+// Post-process calendar event lists:
+// 1. If "Declined: X" exists on the same day, suppress the non-declined "X"
+//    (handles the case where Outlook materializes both the master and the declined exception)
+// 2. If the same subject appears more than once on the same day, keep only the
+//    earliest start time (Outlook sometimes stores both original and modified occurrences)
+function deduplicateCalendarEvents(events: any[]): any[] {
+  // Build set of declined keys: "<baseSubject>|<datePrefix>"
+  const declinedKeys = new Set<string>();
+  for (const e of events) {
+    if (e.subject.startsWith('Declined: ')) {
+      const base = e.subject.slice('Declined: '.length);
+      const day = e.start.split(' at ')[0]?.trim() ?? e.start;
+      declinedKeys.add(`${base}|${day}`);
+    }
+  }
+
+  // Build map of subject+day → event with earliest start time
+  const earliest = new Map<string, any>();
+  for (const e of events) {
+    // Don't deduplicate declined/canceled markers against each other
+    const day = e.start.split(' at ')[0]?.trim() ?? e.start;
+    const key = `${e.subject}|${day}`;
+    if (!earliest.has(key)) {
+      earliest.set(key, e);
+    } else {
+      const cur = earliest.get(key);
+      if (parseStartMinutes(e.start) < parseStartMinutes(cur.start)) {
+        earliest.set(key, e);
+      }
+    }
+  }
+
+  return events.filter(e => {
+    // Suppress plain "X" when "Declined: X" exists on the same day
+    if (!e.subject.startsWith('Declined: ') && !e.subject.startsWith('Canceled: ')) {
+      const day = e.start.split(' at ')[0]?.trim() ?? e.start;
+      if (declinedKeys.has(`${e.subject}|${day}`)) {
+        return false;
+      }
+    }
+    // Keep only the earliest occurrence for a given subject+day
+    const day = e.start.split(' at ')[0]?.trim() ?? e.start;
+    const key = `${e.subject}|${day}`;
+    return earliest.get(key) === e;
+  });
+}
+
 // Function to get today's calendar events
 async function getTodayEvents(limit: number = 10): Promise<any[]> {
   console.error(`[getTodayEvents] Getting today's events, limit: ${limit}`);
@@ -848,76 +847,250 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
   
   const script = `
     tell application "Microsoft Outlook"
-      set todayEvents to {}
-      set theCalendar to default calendar
       set todayDate to current date
       set startOfDay to todayDate - (time of todayDate)
       set endOfDay to startOfDay + 1 * days
-      
-      set eventList to events of theCalendar whose start time is greater than or equal to startOfDay and start time is less than endOfDay
-      
+
+      set eventList to every calendar event whose start time is greater than or equal to startOfDay and start time is less than endOfDay
+
       set eventCount to count of eventList
       set limitCount to ${limit}
-      
       if eventCount < limitCount then
         set limitCount to eventCount
       end if
-      
+
+      set resultStr to ""
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
-        set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
-                     location:location of theEvent, ¬
-                     id:id of theEvent}
-        
-        set end of todayEvents to eventData
+        set evtSubject to subject of theEvent
+        set evtStart to (start time of theEvent) as string
+        set evtEnd to (end time of theEvent) as string
+        -- For recurring masters whose first occurrence falls on today (new series),
+        -- read the actual occurrence time. A specific occurrence may have been rescheduled
+        -- from its original slot. Only apply to non-declined/canceled events to avoid
+        -- calling get occurrence of on exception objects.
+        set phaseOneInclude to true
+        if is recurring of theEvent and not (evtSubject begins with "Declined:") and not (evtSubject begins with "Canceled:") then
+          try
+            set occActual to get occurrence of theEvent at (start time of theEvent)
+            if occActual is not missing value then
+              set occActualStart to start time of occActual
+              if occActualStart >= startOfDay and occActualStart < endOfDay then
+                set evtStart to occActualStart as string
+                set evtEnd to (end time of occActual) as string
+                set evtSubject to subject of occActual
+              else
+                -- Rescheduled to a different day; skip from Phase 1
+                set phaseOneInclude to false
+              end if
+            end if
+          on error
+            -- Occurrence was deleted by organizer; do not show it
+            set phaseOneInclude to false
+          end try
+        end if
+        if phaseOneInclude then
+          set evtLoc to location of theEvent
+          if evtLoc is missing value then set evtLoc to ""
+          set evtId to (id of theEvent) as string
+
+          set evtAttendees to ""
+          try
+            set attList to attendees of theEvent
+            set attCount to count of attList
+            repeat with j from 1 to attCount
+              try
+                set thisAtt to item j of attList
+                set addrRec to email address of thisAtt
+                set rawEmail to address of addrRec
+                set displayName to name of addrRec
+                set attEntry to rawEmail
+                if displayName is not "" and displayName is not missing value then
+                  if displayName contains rawEmail then
+                    set attEntry to displayName
+                  else
+                    set attEntry to displayName & " <" & rawEmail & ">"
+                  end if
+                end if
+                if evtAttendees is "" then
+                  set evtAttendees to attEntry
+                else
+                  set evtAttendees to evtAttendees & ";" & attEntry
+                end if
+              on error
+              end try
+            end repeat
+          on error
+          end try
+
+          set evtRec to evtSubject & (ASCII character 31) &evtStart & (ASCII character 31) &evtEnd & (ASCII character 31) &evtLoc & (ASCII character 31) &evtId & (ASCII character 31) &evtAttendees
+          if resultStr is "" then
+            set resultStr to evtRec
+          else
+            set resultStr to resultStr & (ASCII character 30) &evtRec
+          end if
+        end if -- phaseOneInclude
       end repeat
-      
-      return todayEvents
+
+      -- Phase 2: recurring master events that generate an occurrence today.
+      -- Outlook only stores the master occurrence for self-created recurring events;
+      -- individual instances are not materialized until modified. We compute today's
+      -- occurrences from the recurrence rule.
+      -- Only synthesize for self-organized events: externally-organized recurring
+      -- meetings appear in Phase 1 when active; absence from Phase 1 = canceled.
+      -- Self-created events have organizer = missing value; externally-organized
+      -- events have organizer set to the other person's record.
+      set lookbackDate to (current date) - (730 * days)
+      set allRecurring to every calendar event whose (is recurring is true) and (start time > lookbackDate)
+      set recurCount to count of allRecurring
+      repeat with rk from 1 to recurCount
+        set masterEvent to item rk of allRecurring
+        set masterStart to start time of masterEvent
+
+        -- Skip if the master itself falls on today (already captured in Phase 1)
+        if masterStart < startOfDay or masterStart >= endOfDay then
+          set recData to recurrence of masterEvent
+          set recStartDate to start date of recData
+          set recStartDay to recStartDate - (time of recStartDate)
+
+          if startOfDay >= recStartDay then
+            -- Check that today is before or on the recurrence end date (if any)
+            set inRange to true
+            try
+              set endInfo to end date of recData
+              if (end type of endInfo) is end date type then
+                set recEndDay to (data of endInfo) - (time of (data of endInfo))
+                if startOfDay > recEndDay then
+                  set inRange to false
+                end if
+              end if
+            end try
+
+            if inRange then
+              -- No weekday/interval pre-filter: use get occurrence of to handle
+              -- multi-day recurrence patterns (e.g. Mon+Thu) correctly.
+              -- Check if already captured in Phase 1 (exact subject, Canceled:, or Declined: prefix)
+              set alreadyCaptured to false
+              set masterSubject to subject of masterEvent
+              repeat with k from 1 to eventCount
+                set kSubject to subject of (item k of eventList)
+                if kSubject = masterSubject or kSubject = "Canceled: " & masterSubject or kSubject = "Declined: " & masterSubject then
+                  set alreadyCaptured to true
+                  exit repeat
+                end if
+              end repeat
+
+              if not alreadyCaptured then
+                -- Verify the occurrence actually exists and is not declined/deleted.
+                -- get occurrence of throws an error if the series was ended or the
+                -- specific occurrence was deleted by the organizer.
+                set occExists to false
+                try
+                  set masterTimeOfDay to time of masterStart
+                  set checkDateTime to startOfDay + masterTimeOfDay
+                  set testOcc to get occurrence of masterEvent at checkDateTime
+                  if testOcc is not missing value then
+                    if not (subject of testOcc begins with "Declined:") then
+                      set occExists to true
+                    end if
+                  end if
+                on error
+                  set occExists to false
+                end try
+
+                if occExists then
+                -- Use actual occurrence times (handles rescheduled occurrences)
+                set evtStartToday to start time of testOcc
+                set evtEndToday to end time of testOcc
+                if evtStartToday >= startOfDay and evtStartToday < endOfDay then
+                set evtSubject to subject of masterEvent
+                set evtStart to evtStartToday as string
+                set evtEnd to evtEndToday as string
+                set evtLoc to location of masterEvent
+                if evtLoc is missing value then set evtLoc to ""
+                set evtId to (id of masterEvent) as string
+
+                set evtAttendees to ""
+                try
+                  set attList to attendees of masterEvent
+                  set attCount to count of attList
+                  repeat with j from 1 to attCount
+                    try
+                      set thisAtt to item j of attList
+                      set addrRec to email address of thisAtt
+                      set rawEmail to address of addrRec
+                      set displayName to name of addrRec
+                      set attEntry to rawEmail
+                      if displayName is not "" and displayName is not missing value then
+                        if displayName contains rawEmail then
+                          set attEntry to displayName
+                        else
+                          set attEntry to displayName & " <" & rawEmail & ">"
+                        end if
+                      end if
+                      if evtAttendees is "" then
+                        set evtAttendees to attEntry
+                      else
+                        set evtAttendees to evtAttendees & ";" & attEntry
+                      end if
+                    on error
+                    end try
+                  end repeat
+                on error
+                end try
+
+                set evtRec to evtSubject & (ASCII character 31) &evtStart & (ASCII character 31) &evtEnd & (ASCII character 31) &evtLoc & (ASCII character 31) &evtId & (ASCII character 31) &evtAttendees
+                if resultStr is "" then
+                  set resultStr to evtRec
+                else
+                  set resultStr to resultStr & (ASCII character 30) &evtRec
+                end if
+                end if -- occurrence still today
+                end if -- occExists
+              end if -- not alreadyCaptured
+            end if -- inRange
+          end if -- startOfDay >= recStartDay
+        end if -- masterStart outside today
+      end repeat
+
+      return resultStr
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[getTodayEvents] Raw result length: ${result.length}`);
-    
-    // Parse the results
+
+    if (!result || result.trim() === '') {
+      console.error('[getTodayEvents] No events found for today');
+      return [];
+    }
+
     const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              event[key] = value;
-            }
+    const records = result.split('\x1e');
+    for (const record of records) {
+      try {
+        const parts = record.split('\x1f');
+        if (parts.length >= 5 && parts[0].trim()) {
+          events.push({
+            subject: parts[0].trim(),
+            start: parts[1].trim(),
+            end: parts[2].trim(),
+            location: parts[3].trim() || "No location",
+            id: parts[4].trim(),
+            attendees: parts[5]
+              ? parts[5].split(';').filter((e: string) => e && e.trim())
+              : []
           });
-          
-          if (event.subject) {
-            events.push({
-              subject: event.subject,
-              start: event.start,
-              end: event.end,
-              location: event.location || "No location",
-              id: event.id
-            });
-          }
-        } catch (parseError) {
-          console.error('[getTodayEvents] Error parsing event match:', parseError);
         }
+      } catch (parseError) {
+        console.error('[getTodayEvents] Error parsing event record:', parseError);
       }
     }
-    
-    console.error(`[getTodayEvents] Found ${events.length} events for today`);
-    return events;
+
+    const deduped = deduplicateCalendarEvents(events);
+    console.error(`[getTodayEvents] Found ${deduped.length} events for today (${events.length} before dedup)`);
+    return deduped;
   } catch (error) {
     console.error("[getTodayEvents] Error getting today's events:", error);
     throw error;
@@ -931,76 +1104,256 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
   
   const script = `
     tell application "Microsoft Outlook"
-      set upcomingEvents to {}
-      set theCalendar to default calendar
       set todayDate to current date
       set startOfToday to todayDate - (time of todayDate)
       set endDate to startOfToday + ${days} * days
-      
-      set eventList to events of theCalendar whose start time is greater than or equal to todayDate and start time is less than endDate
-      
+
+      set eventList to every calendar event whose start time is greater than or equal to todayDate and start time is less than endDate
+
       set eventCount to count of eventList
       set limitCount to ${limit}
-      
       if eventCount < limitCount then
         set limitCount to eventCount
       end if
-      
+
+      set resultStr to ""
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
-        set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
-                     location:location of theEvent, ¬
-                     id:id of theEvent}
-        
-        set end of upcomingEvents to eventData
+        set evtSubject to subject of theEvent
+        set evtStart to (start time of theEvent) as string
+        set evtEnd to (end time of theEvent) as string
+        -- For recurring masters whose first occurrence falls in the window (new series),
+        -- read the actual occurrence time. A specific occurrence may have been rescheduled
+        -- from its original slot. Only apply to non-declined/canceled events.
+        set phaseOneInclude to true
+        if is recurring of theEvent and not (evtSubject begins with "Declined:") and not (evtSubject begins with "Canceled:") then
+          try
+            set occActual to get occurrence of theEvent at (start time of theEvent)
+            if occActual is not missing value then
+              set occActualStart to start time of occActual
+              if occActualStart >= todayDate and occActualStart < endDate then
+                set evtStart to occActualStart as string
+                set evtEnd to (end time of occActual) as string
+                set evtSubject to subject of occActual
+              else
+                -- Rescheduled outside the window; skip from Phase 1
+                set phaseOneInclude to false
+              end if
+            end if
+          on error
+            -- Occurrence was deleted by organizer; do not show it
+            set phaseOneInclude to false
+          end try
+        end if
+        if phaseOneInclude then
+          set evtLoc to location of theEvent
+          if evtLoc is missing value then set evtLoc to ""
+          set evtId to (id of theEvent) as string
+
+          set evtAttendees to ""
+          try
+            set attList to attendees of theEvent
+            set attCount to count of attList
+            repeat with j from 1 to attCount
+              try
+                set thisAtt to item j of attList
+                set addrRec to email address of thisAtt
+                set rawEmail to address of addrRec
+                set displayName to name of addrRec
+                set attEntry to rawEmail
+                if displayName is not "" and displayName is not missing value then
+                  if displayName contains rawEmail then
+                    set attEntry to displayName
+                  else
+                    set attEntry to displayName & " <" & rawEmail & ">"
+                  end if
+                end if
+                if evtAttendees is "" then
+                  set evtAttendees to attEntry
+                else
+                  set evtAttendees to evtAttendees & ";" & attEntry
+                end if
+              on error
+              end try
+            end repeat
+          on error
+          end try
+
+          set evtRec to evtSubject & (ASCII character 31) &evtStart & (ASCII character 31) &evtEnd & (ASCII character 31) &evtLoc & (ASCII character 31) &evtId & (ASCII character 31) &evtAttendees
+          if resultStr is "" then
+            set resultStr to evtRec
+          else
+            set resultStr to resultStr & (ASCII character 30) &evtRec
+          end if
+        end if -- phaseOneInclude
       end repeat
-      
-      return upcomingEvents
+
+      -- Phase 2: recurring master events that generate occurrences within the window
+      -- Only synthesize for self-organized events; externally-organized events
+      -- appear in Phase 1 when active, so their absence means they were canceled.
+      -- Self-created events have organizer = missing value; externally-organized
+      -- events have organizer set to the creator's record.
+      set lookbackDate to (current date) - (730 * days)
+      set allRecurring to every calendar event whose (is recurring is true) and (start time > lookbackDate)
+      set recurCount to count of allRecurring
+      repeat with rk from 1 to recurCount
+        set masterEvent to item rk of allRecurring
+        set masterStart to start time of masterEvent
+        -- Skip if the master itself falls within the window (already in Phase 1)
+        if masterStart < todayDate or masterStart >= endDate then
+          set recData to recurrence of masterEvent
+          set recStartDate to start date of recData
+          set recStartDay to recStartDate - (time of recStartDate)
+
+          -- For each day in the window, check if this master generates an occurrence
+          set checkDay to startOfToday
+          repeat while checkDay < endDate
+            if checkDay >= recStartDay then
+              set inRange to true
+              try
+                set endInfo to end date of recData
+                if (end type of endInfo) is end date type then
+                  set recEndDay to (data of endInfo) - (time of (data of endInfo))
+                  if checkDay > recEndDay then
+                    set inRange to false
+                  end if
+                end if
+              end try
+
+              if inRange then
+                -- No weekday/interval pre-filter: use get occurrence of to handle
+                -- multi-day recurrence patterns (e.g. Mon+Thu) correctly.
+                -- Check not already in Phase 1 (exact subject, Canceled:, or Declined: prefix)
+                set alreadyCaptured to false
+                set checkDayEnd to checkDay + 1 * days
+                set masterSubject to subject of masterEvent
+                repeat with k from 1 to eventCount
+                  set kEvent to item k of eventList
+                  set kSubject to subject of kEvent
+                  if kSubject = masterSubject or kSubject = "Canceled: " & masterSubject or kSubject = "Declined: " & masterSubject then
+                    set kStart to start time of kEvent
+                    if kStart >= checkDay and kStart < checkDayEnd then
+                      set alreadyCaptured to true
+                      exit repeat
+                    end if
+                  end if
+                end repeat
+
+                if not alreadyCaptured then
+                  -- Verify the occurrence actually exists and is not declined/deleted.
+                  -- get occurrence of throws an error if the series was ended or the
+                  -- specific occurrence was deleted by the organizer.
+                  set occExists to false
+                  try
+                    set masterTimeOfDay to time of masterStart
+                    set checkDateTime to checkDay + masterTimeOfDay
+                    set testOcc to get occurrence of masterEvent at checkDateTime
+                    if testOcc is not missing value then
+                      if not (subject of testOcc begins with "Declined:") then
+                        set occExists to true
+                      end if
+                    end if
+                  on error
+                    set occExists to false
+                  end try
+
+                  if occExists then
+                  -- Use actual occurrence times (handles rescheduled occurrences)
+                  set evtStartOnDay to start time of testOcc
+                  set evtEndOnDay to end time of testOcc
+
+                  -- Only include if the occurrence start is within window
+                  if evtStartOnDay >= todayDate and evtStartOnDay < endDate then
+                    set evtSubject to subject of masterEvent
+                    set evtStart to evtStartOnDay as string
+                    set evtEnd to evtEndOnDay as string
+                    set evtLoc to location of masterEvent
+                    if evtLoc is missing value then set evtLoc to ""
+                    set evtId to (id of masterEvent) as string
+
+                    set evtAttendees to ""
+                    try
+                      set attList to attendees of masterEvent
+                      set attCount to count of attList
+                      repeat with j from 1 to attCount
+                        try
+                          set thisAtt to item j of attList
+                          set addrRec to email address of thisAtt
+                          set rawEmail to address of addrRec
+                          set displayName to name of addrRec
+                          set attEntry to rawEmail
+                          if displayName is not "" and displayName is not missing value then
+                            if displayName contains rawEmail then
+                              set attEntry to displayName
+                            else
+                              set attEntry to displayName & " <" & rawEmail & ">"
+                            end if
+                          end if
+                          if evtAttendees is "" then
+                            set evtAttendees to attEntry
+                          else
+                            set evtAttendees to evtAttendees & ";" & attEntry
+                          end if
+                        on error
+                        end try
+                      end repeat
+                    on error
+                    end try
+
+                    set evtRec to evtSubject & (ASCII character 31) &evtStart & (ASCII character 31) &evtEnd & (ASCII character 31) &evtLoc & (ASCII character 31) &evtId & (ASCII character 31) &evtAttendees
+                    if resultStr is "" then
+                      set resultStr to evtRec
+                    else
+                      set resultStr to resultStr & (ASCII character 30) &evtRec
+                    end if
+                  end if -- evtStartOnDay in window
+                  end if -- occExists
+                end if -- not alreadyCaptured
+              end if -- inRange
+            end if -- checkDay >= recStartDay
+            set checkDay to checkDay + 1 * days
+          end repeat
+        end if -- masterStart outside window
+      end repeat
+
+      return resultStr
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[getUpcomingEvents] Raw result length: ${result.length}`);
-    
-    // Parse the results
+
+    if (!result || result.trim() === '') {
+      console.error('[getUpcomingEvents] No upcoming events found');
+      return [];
+    }
+
     const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              event[key] = value;
-            }
+    const records = result.split('\x1e');
+    for (const record of records) {
+      try {
+        const parts = record.split('\x1f');
+        if (parts.length >= 5 && parts[0].trim()) {
+          events.push({
+            subject: parts[0].trim(),
+            start: parts[1].trim(),
+            end: parts[2].trim(),
+            location: parts[3].trim() || "No location",
+            id: parts[4].trim(),
+            attendees: parts[5]
+              ? parts[5].split(';').filter((e: string) => e && e.trim())
+              : []
           });
-          
-          if (event.subject) {
-            events.push({
-              subject: event.subject,
-              start: event.start,
-              end: event.end,
-              location: event.location || "No location",
-              id: event.id
-            });
-          }
-        } catch (parseError) {
-          console.error('[getUpcomingEvents] Error parsing event match:', parseError);
         }
+      } catch (parseError) {
+        console.error('[getUpcomingEvents] Error parsing event record:', parseError);
       }
     }
-    
-    console.error(`[getUpcomingEvents] Found ${events.length} upcoming events`);
-    return events;
+
+    const deduped = deduplicateCalendarEvents(events);
+    console.error(`[getUpcomingEvents] Found ${deduped.length} upcoming events (${events.length} before dedup)`);
+    return deduped;
   } catch (error) {
     console.error("[getUpcomingEvents] Error getting upcoming events:", error);
     throw error;
@@ -1014,72 +1367,68 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
   
   const script = `
     tell application "Microsoft Outlook"
-      set searchResults to {}
-      set theCalendar to default calendar
-      set allEvents to events of theCalendar
+      set windowStart to (current date) - (365 * days)
+      set windowEnd to (current date) + (365 * days)
+      set allEvents to every calendar event whose (start time >= windowStart) and (start time <= windowEnd)
       set i to 0
-      set searchString to "${searchTerm.replace(/"/g, '\\"')}"
-      
+      set searchString to "${escapeAppleScriptString(searchTerm)}"
+      set resultStr to ""
+
       repeat with theEvent in allEvents
         if (subject of theEvent contains searchString) or (location of theEvent contains searchString) then
           set i to i + 1
-          set eventData to {subject:subject of theEvent, ¬
-                       start:start time of theEvent, ¬
-                       end:end time of theEvent, ¬
-                       location:location of theEvent, ¬
-                       id:id of theEvent}
-          
-          set end of searchResults to eventData
-          
-          -- Stop if we've reached the limit
+          set evtSubject to subject of theEvent
+          set evtStart to (start time of theEvent) as string
+          set evtEnd to (end time of theEvent) as string
+          set evtLoc to location of theEvent
+          if evtLoc is missing value then set evtLoc to ""
+          set evtId to (id of theEvent) as string
+
+          set evtRec to evtSubject & (ASCII character 31) &evtStart & (ASCII character 31) &evtEnd & (ASCII character 31) &evtLoc & (ASCII character 31) &evtId
+          if resultStr is "" then
+            set resultStr to evtRec
+          else
+            set resultStr to resultStr & (ASCII character 30) &evtRec
+          end if
+
           if i >= ${limit} then
             exit repeat
           end if
         end if
       end repeat
-      
-      return searchResults
+
+      return resultStr
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[searchEvents] Raw result length: ${result.length}`);
-    
-    // Parse the results
+
+    if (!result || result.trim() === '') {
+      console.error('[searchEvents] No matching events found');
+      return [];
+    }
+
     const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              event[key] = value;
-            }
+    const records = result.split('\x1e');
+    for (const record of records) {
+      try {
+        const parts = record.split('\x1f');
+        if (parts.length >= 5 && parts[0].trim()) {
+          events.push({
+            subject: parts[0].trim(),
+            start: parts[1].trim(),
+            end: parts[2].trim(),
+            location: parts[3].trim() || "No location",
+            id: parts[4].trim()
           });
-          
-          if (event.subject) {
-            events.push({
-              subject: event.subject,
-              start: event.start,
-              end: event.end,
-              location: event.location || "No location",
-              id: event.id
-            });
-          }
-        } catch (parseError) {
-          console.error('[searchEvents] Error parsing event match:', parseError);
         }
+      } catch (parseError) {
+        console.error('[searchEvents] Error parsing event record:', parseError);
       }
     }
-    
+
     console.error(`[searchEvents] Found ${events.length} matching events`);
     return events;
   } catch (error) {
@@ -1102,9 +1451,9 @@ async function createEvent(subject: string, start: string, end: string, location
   const formattedEnd = `date "${endDate.getMonth() + 1}/${endDate.getDate()}/${endDate.getFullYear()} ${endDate.getHours()}:${endDate.getMinutes()}:${endDate.getSeconds()}"`;
   
   // Escape strings for AppleScript
-  const escapedSubject = subject.replace(/"/g, '\\"');
-  const escapedLocation = location ? location.replace(/"/g, '\\"') : "";
-  const escapedBody = body ? body.replace(/"/g, '\\"') : "";
+  const escapedSubject = escapeAppleScriptString(subject);
+  const escapedLocation = location ? escapeAppleScriptString(location) : "";
+  const escapedBody = body ? escapeAppleScriptString(body) : "";
   
   let script = `
     tell application "Microsoft Outlook"
@@ -1128,7 +1477,7 @@ async function createEvent(subject: string, start: string, end: string, location
     const attendeeList = attendees.split(',').map(email => email.trim());
     
     for (const attendee of attendeeList) {
-      const escapedAttendee = attendee.replace(/"/g, '\\"');
+      const escapedAttendee = escapeAppleScriptString(attendee);
       script += `
         make new attendee at newEvent with properties {email address:"${escapedAttendee}"}
       `;
@@ -1309,8 +1658,8 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
         set searchResults to {}
         set allContacts to contacts
         set i to 0
-        set searchString to "${searchTerm.replace(/"/g, '\\"')}"
-        
+        set searchString to "${escapeAppleScriptString(searchTerm)}"
+
         repeat with theContact in allContacts
           try
             set contactName to full name of theContact
@@ -1409,9 +1758,9 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
         const alternativeScript = `
           tell application "Microsoft Outlook"
             set matchingContacts to {}
-            set searchString to "${searchTerm.replace(/"/g, '\\"')}"
+            set searchString to "${escapeAppleScriptString(searchTerm)}"
             set i to 0
-            
+
             repeat with theContact in contacts
               try
                 set contactName to full name of theContact
