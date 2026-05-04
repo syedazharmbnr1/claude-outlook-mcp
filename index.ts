@@ -256,15 +256,11 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
     tell application "Microsoft Outlook"
       try
         -- Look up folder by name to avoid unquoted identifier injection
-        set targetFolder to null
-        set allFolders to mail folders
-        repeat with mailFolder in allFolders
-          if name of mailFolder is "${escapedFolderName}" then
-            set targetFolder to mailFolder
-            exit repeat
-          end if
-        end repeat
-        if targetFolder is null then set targetFolder to inbox
+        try
+          set targetFolder to (first mail folder whose name is "${escapedFolderName}")
+        on error
+          set targetFolder to inbox
+        end try
         set theFolder to targetFolder
         set unreadMessages to {}
         set allMessages to messages of theFolder
@@ -365,15 +361,11 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
     tell application "Microsoft Outlook"
       try
         -- Look up folder by name to avoid unquoted identifier injection
-        set targetFolder to null
-        set allFolders to mail folders
-        repeat with mailFolder in allFolders
-          if name of mailFolder is "${escapedFolderName}" then
-            set targetFolder to mailFolder
-            exit repeat
-          end if
-        end repeat
-        if targetFolder is null then set targetFolder to inbox
+        try
+          set targetFolder to (first mail folder whose name is "${escapedFolderName}")
+        on error
+          set targetFolder to inbox
+        end try
         set theFolder to targetFolder
         set searchResults to {}
         set allMessages to messages of theFolder
@@ -716,16 +708,11 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
       tell application "Microsoft Outlook"
         try
           -- Get the folder by name safely
-          set targetFolder to null
-          set allFolders to mail folders
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${escapedFolderName}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          
-          if targetFolder is null then set targetFolder to inbox
+          try
+            set targetFolder to (first mail folder whose name is "${escapedFolderName}")
+          on error
+            set targetFolder to inbox
+          end try
           
           -- Get messages
           set messageList to {}
@@ -790,14 +777,20 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
 // Convert an AppleScript date string like "Tuesday, May 5, 2026 at 2:00:00 PM"
 // to a comparable minutes-since-midnight value (for same-day ordering only).
 function parseStartMinutes(start: string): number {
-  const m = start.match(/at (\d+):(\d+):\d+ (AM|PM)/i);
-  if (!m) return 0;
-  let h = parseInt(m[1]);
-  const min = parseInt(m[2]);
-  const meridiem = m[3].toUpperCase();
-  if (meridiem === 'PM' && h !== 12) h += 12;
-  if (meridiem === 'AM' && h === 12) h = 0;
-  return h * 60 + min;
+  // Try 12-hour format first: "at 2:30:00 PM"
+  const m12 = start.match(/at (\d+):(\d+):\d+\s+(AM|PM)/i);
+  if (m12) {
+    let h = parseInt(m12[1]);
+    const min = parseInt(m12[2]);
+    const meridiem = m12[3].toUpperCase();
+    if (meridiem === 'PM' && h !== 12) h += 12;
+    if (meridiem === 'AM' && h === 12) h = 0;
+    return h * 60 + min;
+  }
+  // Fall back to 24-hour format: "at 14:30:00"
+  const m24 = start.match(/at (\d+):(\d+):\d+/);
+  if (m24) return parseInt(m24[1]) * 60 + parseInt(m24[2]);
+  return 0;
 }
 
 // Post-process calendar event lists:
@@ -930,11 +923,11 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
           on error
           end try
 
-          set evtRec to evtSubject & "|||" & evtStart & "|||" & evtEnd & "|||" & evtLoc & "|||" & evtId & "|||" & evtAttendees
+          set evtRec to evtSubject & (ASCII character 31) &evtStart & (ASCII character 31) &evtEnd & (ASCII character 31) &evtLoc & (ASCII character 31) &evtId & (ASCII character 31) &evtAttendees
           if resultStr is "" then
             set resultStr to evtRec
           else
-            set resultStr to resultStr & "###" & evtRec
+            set resultStr to resultStr & (ASCII character 30) &evtRec
           end if
         end if -- phaseOneInclude
       end repeat
@@ -947,7 +940,8 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
       -- meetings appear in Phase 1 when active; absence from Phase 1 = canceled.
       -- Self-created events have organizer = missing value; externally-organized
       -- events have organizer set to the other person's record.
-      set allRecurring to every calendar event whose is recurring is true
+      set lookbackDate to (current date) - (730 * days)
+      set allRecurring to every calendar event whose (is recurring is true) and (start time > lookbackDate)
       set recurCount to count of allRecurring
       repeat with rk from 1 to recurCount
         set masterEvent to item rk of allRecurring
@@ -1045,11 +1039,11 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
                 on error
                 end try
 
-                set evtRec to evtSubject & "|||" & evtStart & "|||" & evtEnd & "|||" & evtLoc & "|||" & evtId & "|||" & evtAttendees
+                set evtRec to evtSubject & (ASCII character 31) &evtStart & (ASCII character 31) &evtEnd & (ASCII character 31) &evtLoc & (ASCII character 31) &evtId & (ASCII character 31) &evtAttendees
                 if resultStr is "" then
                   set resultStr to evtRec
                 else
-                  set resultStr to resultStr & "###" & evtRec
+                  set resultStr to resultStr & (ASCII character 30) &evtRec
                 end if
                 end if -- occurrence still today
                 end if -- occExists
@@ -1073,10 +1067,10 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
     }
 
     const events = [];
-    const records = result.split('###');
+    const records = result.split('\x1e');
     for (const record of records) {
       try {
-        const parts = record.split('|||');
+        const parts = record.split('\x1f');
         if (parts.length >= 5 && parts[0].trim()) {
           events.push({
             subject: parts[0].trim(),
@@ -1185,11 +1179,11 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
           on error
           end try
 
-          set evtRec to evtSubject & "|||" & evtStart & "|||" & evtEnd & "|||" & evtLoc & "|||" & evtId & "|||" & evtAttendees
+          set evtRec to evtSubject & (ASCII character 31) &evtStart & (ASCII character 31) &evtEnd & (ASCII character 31) &evtLoc & (ASCII character 31) &evtId & (ASCII character 31) &evtAttendees
           if resultStr is "" then
             set resultStr to evtRec
           else
-            set resultStr to resultStr & "###" & evtRec
+            set resultStr to resultStr & (ASCII character 30) &evtRec
           end if
         end if -- phaseOneInclude
       end repeat
@@ -1199,7 +1193,8 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
       -- appear in Phase 1 when active, so their absence means they were canceled.
       -- Self-created events have organizer = missing value; externally-organized
       -- events have organizer set to the creator's record.
-      set allRecurring to every calendar event whose is recurring is true
+      set lookbackDate to (current date) - (730 * days)
+      set allRecurring to every calendar event whose (is recurring is true) and (start time > lookbackDate)
       set recurCount to count of allRecurring
       repeat with rk from 1 to recurCount
         set masterEvent to item rk of allRecurring
@@ -1305,11 +1300,11 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
                     on error
                     end try
 
-                    set evtRec to evtSubject & "|||" & evtStart & "|||" & evtEnd & "|||" & evtLoc & "|||" & evtId & "|||" & evtAttendees
+                    set evtRec to evtSubject & (ASCII character 31) &evtStart & (ASCII character 31) &evtEnd & (ASCII character 31) &evtLoc & (ASCII character 31) &evtId & (ASCII character 31) &evtAttendees
                     if resultStr is "" then
                       set resultStr to evtRec
                     else
-                      set resultStr to resultStr & "###" & evtRec
+                      set resultStr to resultStr & (ASCII character 30) &evtRec
                     end if
                   end if -- evtStartOnDay in window
                   end if -- occExists
@@ -1335,10 +1330,10 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
     }
 
     const events = [];
-    const records = result.split('###');
+    const records = result.split('\x1e');
     for (const record of records) {
       try {
-        const parts = record.split('|||');
+        const parts = record.split('\x1f');
         if (parts.length >= 5 && parts[0].trim()) {
           events.push({
             subject: parts[0].trim(),
@@ -1372,7 +1367,9 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
   
   const script = `
     tell application "Microsoft Outlook"
-      set allEvents to every calendar event
+      set windowStart to (current date) - (365 * days)
+      set windowEnd to (current date) + (365 * days)
+      set allEvents to every calendar event whose (start time >= windowStart) and (start time <= windowEnd)
       set i to 0
       set searchString to "${escapeAppleScriptString(searchTerm)}"
       set resultStr to ""
@@ -1387,11 +1384,11 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
           if evtLoc is missing value then set evtLoc to ""
           set evtId to (id of theEvent) as string
 
-          set evtRec to evtSubject & "|||" & evtStart & "|||" & evtEnd & "|||" & evtLoc & "|||" & evtId
+          set evtRec to evtSubject & (ASCII character 31) &evtStart & (ASCII character 31) &evtEnd & (ASCII character 31) &evtLoc & (ASCII character 31) &evtId
           if resultStr is "" then
             set resultStr to evtRec
           else
-            set resultStr to resultStr & "###" & evtRec
+            set resultStr to resultStr & (ASCII character 30) &evtRec
           end if
 
           if i >= ${limit} then
@@ -1414,10 +1411,10 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
     }
 
     const events = [];
-    const records = result.split('###');
+    const records = result.split('\x1e');
     for (const record of records) {
       try {
-        const parts = record.split('|||');
+        const parts = record.split('\x1f');
         if (parts.length >= 5 && parts[0].trim()) {
           events.push({
             subject: parts[0].trim(),
