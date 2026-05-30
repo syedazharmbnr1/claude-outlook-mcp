@@ -239,31 +239,64 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
         set i to 0
         
         repeat with theMessage in allMessages
-          if read status of theMessage is false then
-            set i to i + 1
-            set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
-                       date:time sent of theMessage, id:id of theMessage}
-            
-            -- Try to get content
+          try
+            set isUnread to false
             try
-              set msgContent to content of theMessage
-              if length of msgContent > 500 then
-                set msgContent to (text 1 thru 500 of msgContent) & "..."
-              end if
-              set msgData to msgData & {content:msgContent}
+              set isUnread to (read status of theMessage is false)
             on error
-              set msgData to msgData & {content:"[Content not available]"}
+              -- Some messages have unreadable read-status (e.g. malformed
+              -- notifications from bots, corrupt items). Skip them silently.
+              set isUnread to false
             end try
-            
-            set end of unreadMessages to msgData
-            
-            -- Stop if we've reached the limit
-            if i >= ${limit} then
-              exit repeat
+
+            if isUnread then
+              set i to i + 1
+
+              set msgSubject to "(no subject)"
+              try
+                set msgSubject to subject of theMessage
+              end try
+
+              set msgSender to "(unknown sender)"
+              try
+                set msgSender to sender of theMessage
+              end try
+
+              set msgDate to ""
+              try
+                set msgDate to time sent of theMessage
+              end try
+
+              set msgId to ""
+              try
+                set msgId to id of theMessage
+              end try
+
+              set msgData to {subject:msgSubject, sender:msgSender, date:msgDate, id:msgId}
+
+              -- Try to get content
+              try
+                set msgContent to content of theMessage
+                if length of msgContent > 500 then
+                  set msgContent to (text 1 thru 500 of msgContent) & "..."
+                end if
+                set msgData to msgData & {content:msgContent}
+              on error
+                set msgData to msgData & {content:"[Content not available]"}
+              end try
+
+              set end of unreadMessages to msgData
+
+              -- Stop if we've reached the limit
+              if i >= ${limit} then
+                exit repeat
+              end if
             end if
-          end if
+          on error
+            -- Any unhandled per-message error: skip and keep going.
+          end try
         end repeat
-        
+
         return unreadMessages
       on error errMsg
         return "Error: " & errMsg
@@ -866,11 +899,11 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
         set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
+                     startTime:start time of theEvent, ¬
+                     endTime:end time of theEvent, ¬
                      location:location of theEvent, ¬
                      id:id of theEvent}
-        
+
         set end of todayEvents to eventData
       end repeat
       
@@ -904,8 +937,8 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
           if (event.subject) {
             events.push({
               subject: event.subject,
-              start: event.start,
-              end: event.end,
+              start: event.startTime,
+              end: event.endTime,
               location: event.location || "No location",
               id: event.id
             });
@@ -949,11 +982,11 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
         set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
+                     startTime:start time of theEvent, ¬
+                     endTime:end time of theEvent, ¬
                      location:location of theEvent, ¬
                      id:id of theEvent}
-        
+
         set end of upcomingEvents to eventData
       end repeat
       
@@ -987,8 +1020,8 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
           if (event.subject) {
             events.push({
               subject: event.subject,
-              start: event.start,
-              end: event.end,
+              start: event.startTime,
+              end: event.endTime,
               location: event.location || "No location",
               id: event.id
             });
@@ -1024,11 +1057,11 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
         if (subject of theEvent contains searchString) or (location of theEvent contains searchString) then
           set i to i + 1
           set eventData to {subject:subject of theEvent, ¬
-                       start:start time of theEvent, ¬
-                       end:end time of theEvent, ¬
+                       startTime:start time of theEvent, ¬
+                       endTime:end time of theEvent, ¬
                        location:location of theEvent, ¬
                        id:id of theEvent}
-          
+
           set end of searchResults to eventData
           
           -- Stop if we've reached the limit
@@ -1068,8 +1101,8 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
           if (event.subject) {
             events.push({
               subject: event.subject,
-              start: event.start,
-              end: event.end,
+              start: event.startTime,
+              end: event.endTime,
               location: event.location || "No location",
               id: event.id
             });
